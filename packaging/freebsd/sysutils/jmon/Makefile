@@ -23,6 +23,6 @@ post-install:
 	${INSTALL_DATA} ${WRKSRC}/contrib/jmon.conf.sample \
 		${STAGEDIR}${PREFIX}/etc/jmon.conf.sample
 
-# Before the first build, run `make makesum` and
-# `make cargo-crates > Makefile.crates` to pin the crate dependencies.
+# After a version bump, regenerate the crate list and checksums with
+# `make makesum && make cargo-crates > Makefile.crates && make makesum`.
 .include <bsd.port.mk>
