@@ -1,0 +1,48 @@
+[package]
+name = "jmon"
+version = "0.1.0"
+edition = "2024"
+description = "nmon-style system monitor for FreeBSD that emits OpenTelemetry metrics"
+license = "BSD-2-Clause"
+
+[dependencies]
+anyhow = "1.0.104"
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
+clap = { version = "4.6.7", features = ["derive", "env"] }
+hostname = "0.4.2"
+libc = "0.2.191"
+opentelemetry = { version = "0.33.1", default-features = false, features = ["metrics"] }
+opentelemetry-otlp = { version = "0.33.1", default-features = false, features = [
+    "metrics",
+    "grpc-tonic",
+    "http-proto",
+    "http-json",
+    "reqwest-blocking-client",
+    "internal-logs",
+] }
+opentelemetry_sdk = { version = "0.33.1", default-features = false, features = ["metrics", "internal-logs"] }
+ratatui = "0.30.2"
+reqwest = { version = "0.13", default-features = false, features = ["blocking", "rustls"], optional = true }
+serde = { version = "1.0.229", features = ["derive", "rc"] }
+serde_json = "1.0.154"
+tokio = { version = "1.54.1", features = ["rt-multi-thread", "macros", "signal", "time", "net", "io-util", "sync"] }
+toml = "1"
+tracing = "0.1.44"
+tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
+
+[features]
+default = ["tls"]
+# TLS for OTLP (rustls + aws-lc). Disable for a smaller build, or to
+# cross-check from a host without a C toolchain for the target:
+#   cargo check --target x86_64-unknown-freebsd --no-default-features
+tls = [
+    "dep:reqwest",
+    "opentelemetry-otlp/tls-aws-lc",
+    "opentelemetry-otlp/tls-roots",
+    "opentelemetry-otlp/reqwest-rustls",
+]
+
+[profile.release]
+lto = "thin"
+strip = true
+

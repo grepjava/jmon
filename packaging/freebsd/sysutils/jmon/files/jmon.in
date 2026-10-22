@@ -1,0 +1,36 @@
+#!/bin/sh
+#
+# PROVIDE: jmon
+# REQUIRE: LOGIN NETWORKING
+# KEYWORD: shutdown
+#
+# Configure jmon in %%PREFIX%%/etc/jmon.conf (see jmon(1)), then:
+#
+#   sysrc jmon_enable=YES
+#   service jmon start
+#
+# Optional rc.conf variables:
+#   jmon_runas="nobody"        unprivileged user to run as
+#   jmon_flags=""              extra command-line options (override the config file)
+#   jmon_env="OTEL_RESOURCE_ATTRIBUTES=deployment.environment=prod"
+#
+# jmon logs to syslog with the tag "jmon".
+
+. /etc/rc.subr
+
+name="jmon"
+rcvar="jmon_enable"
+
+load_rc_config $name
+
+: ${jmon_enable:="NO"}
+: ${jmon_flags:=""}
+: ${jmon_runas:="nobody"}
+
+pidfile="/var/run/${name}.pid"
+command="/usr/sbin/daemon"
+command_args="-f -r -P ${pidfile} -u ${jmon_runas} %%PREFIX%%/bin/jmon -d --syslog ${jmon_flags}"
+# rc.subr would otherwise also pass jmon_flags to daemon(8) itself.
+jmon_flags=""
+
+run_rc_command "$1"

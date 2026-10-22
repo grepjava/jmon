@@ -1,0 +1,22 @@
+# FreeBSD builds run the real collectors and the fixture tests; the Linux
+# build exercises the demo platform and the exporters.
+freebsd_task:
+  matrix:
+    - name: FreeBSD 14
+      freebsd_instance:
+        image_family: freebsd-14-3
+    - name: FreeBSD 15
+      freebsd_instance:
+        image_family: freebsd-15-0
+  setup_script: pkg install -y rust
+  build_script: cargo build --locked
+  test_script: cargo test --locked
+  clippy_script: cargo clippy --locked -- -D warnings
+  manpage_script: mandoc -T lint -W warning man/jmon.1
+
+linux_task:
+  name: Linux (demo platform)
+  container:
+    image: rust:latest
+  build_script: cargo build --locked
+  test_script: cargo test --locked

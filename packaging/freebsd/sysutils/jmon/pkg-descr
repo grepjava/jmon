@@ -1,0 +1,9 @@
+jmon is a performance monitor for FreeBSD modelled on nmon. Its interactive
+screen shows CPU, memory, disks (with latency and queue depth), network, TCP,
+filesystems, ZFS ARC and pools, jails, bhyve VMs, temperatures and top
+processes, toggled with single keys.
+
+The same data can be exported as OpenTelemetry metrics over OTLP (gRPC or
+HTTP, optionally TLS), served to Prometheus, or recorded to nmon-compatible
+files for nmon analyser. Everything is read through sysctl(3) and related
+interfaces, so jmon runs unprivileged.

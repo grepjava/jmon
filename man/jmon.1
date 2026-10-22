@@ -1,0 +1,300 @@
+.Dd October 22, 2026
+.Dt JMON 1
+.Os
+.Sh NAME
+.Nm jmon
+.Nd nmon-style performance monitor with OpenTelemetry export
+.Sh SYNOPSIS
+.Nm
+.Op Fl d
+.Op Fl f
+.Op Fl s Ar seconds
+.Op Fl c Ar count
+.Op Fl F Ar path
+.Op Fl -show Ar keys
+.Op Fl -otlp-endpoint Ar url
+.Op Fl -prometheus Ar addr
+.Op Fl -config Ar path
+.Op Ar options ...
+.Sh DESCRIPTION
+.Nm
+shows CPU, memory, disk, network, filesystem, process, jail, ZFS and sensor
+statistics on an interactive screen modelled on
+.Xr nmon 1 ,
+and can export the same data as OpenTelemetry metrics over OTLP, as a
+Prometheus scrape endpoint, and as nmon-compatible capture files.
+All data comes from
+.Xr sysctl 3 ,
+.Xr getifaddrs 3 ,
+.Xr getmntinfo 3
+and
+.Xr jail_get 2 ,
+so no special privileges are needed.
+.Pp
+Without
+.Fl d ,
+.Fl f
+or
+.Fl -once ,
+.Nm
+runs interactively; any exporters given run at the same time.
+.Ss Interactive keys
+.Bl -tag -width "3, 4, 5" -compact
+.It Cm c
+CPU utilisation per processor; a
+.Ql >
+marks each CPU's peak since start
+.It Cm C
+compact CPU grid, for machines with many cores
+.It Cm l
+long-term CPU graph
+.It Cm m
+memory by page queue, ZFS ARC and swap
+.It Cm V
+virtual memory: faults by type, pager activity, page daemon
+.It Cm L
+superpage mappings, promotions and demotions
+.It Cm k
+load, run queue and blocked threads, context switches, interrupts,
+system calls, faults
+.It Cm d
+disk throughput, operations, latency and queue depth
+.It Cm G
+also show partitions and other GEOM providers in the disk views
+.It Cm g
+disk groups (see
+.Fl -disk-group )
+.It Cm o
+disk busy map, one cell per disk
+.It Cm n
+network interfaces
+.It Cm T
+TCP segments, retransmits, listen-queue overflows, connection states
+.It Cm N
+NFS client and server operations, retries and timeouts
+.It Cm j
+filesystems
+.It Cm z
+ZFS ARC hit ratio and pool capacity, health and I/O
+.It Cm J
+jails and
+.Xr bhyve 8
+virtual machines
+.It Cm s
+CPU temperature (current, hottest core, and session peak with its time),
+clock, ACPI thermal zones, battery.
+Temperatures turn yellow within 30\(de and red within 15\(de of the
+CPU's throttle point
+.It Cm R
+reset the temperature peak
+.It Cm t
+top processes
+.It Cm 3 , 4 , 5
+sort top processes by CPU, memory or I/O
+.It Cm a
+show full command lines in the process list
+.It Cm u
+show only one user's processes
+.It Cm \&.
+hide idle CPUs, disks, interfaces and processes
+.It Cm p
+pause and resume
+.It Cm v
+checks: each statistic with an ok, warning or danger verdict
+.It Cm 0
+reset the CPU peak markers
+.It Cm b
+black and white
+.It Cm + , -
+double or halve the sampling interval
+.It Cm r
+system resources
+.It Cm h
+help
+.It Cm q
+quit
+.El
+.Sh OPTIONS
+.Bl -tag -width indent
+.It Fl s , Fl -interval Ar seconds
+Seconds between samples.
+Default 2.
+.It Fl c , Fl -count Ar count
+Exit after this many samples.
+.It Fl d , Fl -daemon
+Run without the screen, only collecting and exporting.
+.It Fl -show Ar keys
+Panels to open at start, given as screen keys, for example
+.Ql cmdnt .
+Also read from the
+.Ev JMON
+environment variable.
+.It Fl f
+Record to
+.Pa <host>_<YYMMDD>_<HHMM>.nmon
+in the record directory and run without the screen, like
+.Ql nmon -f .
+.It Fl F , Fl -record Ar path
+Record samples to
+.Ar path ,
+or to standard output if
+.Ar path
+is
+.Ql - .
+.It Fl -record-format Cm nmon | jsonl
+Format for recordings.
+.Cm nmon
+files can be loaded into nmon analyser or nmonchart.
+.It Fl -record-dir Ar dir
+Directory for
+.Fl f
+recordings.
+.It Fl -rotate
+With
+.Fl f ,
+start a new file every day at local midnight.
+.It Fl -record-keep Ar days
+With
+.Fl -rotate ,
+delete this host's recordings older than
+.Ar days .
+.It Fl -otlp-endpoint Ar url
+Push metrics over OTLP, for example
+.Ql http://collector:4317 .
+Use an
+.Ql https://
+URL for TLS.
+.It Fl -otlp-protocol Cm grpc | http/protobuf | http/json
+OTLP transport.
+Default
+.Cm grpc .
+.It Fl -otlp-interval Ar seconds
+Seconds between OTLP exports.
+Default 10.
+.It Fl -otlp-ca Ar path
+PEM file of additional CA certificates to trust for TLS.
+.It Fl -prometheus Ar addr
+Serve Prometheus metrics on
+.Ar addr ,
+for example
+.Ql 0.0.0.0:9464 ,
+at
+.Pa /metrics .
+.It Fl -disk-group Ar name Ns = Ns Ar disk Ns Op , Ns Ar disk ...
+Define a disk group, shown with
+.Cm g
+and recorded as nmon
+.Ql DG
+sections.
+Members may be disks or GEOM providers such as partitions.
+Repeat the option for more groups.
+.It Fl -export-top Ar n
+Also export per-process metrics for the
+.Ar n
+busiest processes.
+Off by default because process metrics have high cardinality.
+.It Fl -once
+Print one sample as JSON and exit.
+.It Fl -config Ar path
+Read options from a TOML file.
+Default
+.Pa /usr/local/etc/jmon.conf
+if it exists.
+.It Fl -syslog
+Log to
+.Xr syslog 3
+with the daemon facility.
+.It Fl -log-file Ar path
+Append log messages to
+.Ar path .
+.El
+.Sh CONFIGURATION FILE
+The configuration file uses the long option names as keys.
+Options given on the command line override the file.
+.Bd -literal -offset indent
+# /usr/local/etc/jmon.conf
+interval = 10
+otlp-endpoint = "https://collector.example.org:4317"
+otlp-ca = "/usr/local/etc/ssl/collector-ca.pem"
+prometheus = "127.0.0.1:9464"
+export-top = 10
+.Ed
+.Sh ENVIRONMENT
+.Bl -tag -width OTEL_EXPORTER_OTLP_ENDPOINT
+.It Ev JMON
+Panels to open at start.
+.It Ev JMON_CONFIG
+Configuration file to read.
+.It Ev NO_COLOR
+Start in black and white.
+.It Ev NMON_START , NMON_SNAP , NMON_END
+Shell commands run at the start of an nmon recording, after each
+snapshot (with the snapshot tag, such as
+.Ql T0001 ,
+as
+.Li $1 ) ,
+and at the end.
+Their output is appended to the recording, so they can add their own
+sections, as with
+.Xr nmon 1 Ns 's
+external data collectors.
+.Ev JMON_START ,
+.Ev JMON_SNAP
+and
+.Ev JMON_END
+take precedence.
+.It Ev JMON_LOG
+Log filter, for example
+.Ql debug .
+.It Ev OTEL_EXPORTER_OTLP_ENDPOINT
+Enables OTLP export when no endpoint is given on the command line.
+The other standard
+.Ev OTEL_*
+variables, such as
+.Ev OTEL_EXPORTER_OTLP_HEADERS ,
+.Ev OTEL_EXPORTER_OTLP_CERTIFICATE ,
+.Ev OTEL_RESOURCE_ATTRIBUTES
+and
+.Ev OTEL_SERVICE_NAME ,
+are honoured.
+.El
+.Sh FILES
+.Bl -tag -width /usr/local/etc/rc.d/jmon -compact
+.It Pa /usr/local/etc/jmon.conf
+configuration file
+.It Pa /usr/local/etc/rc.d/jmon
+service script
+.El
+.Sh EXAMPLES
+Watch CPU, memory, disks, network and top processes:
+.Dl jmon --show cmdnt
+.Pp
+Run as a service exporting to a Collector:
+.Bd -literal -offset indent
+echo 'otlp-endpoint = "http://collector:4317"' > /usr/local/etc/jmon.conf
+sysrc jmon_enable=YES
+service jmon start
+.Ed
+.Pp
+Record a day of one-minute samples to daily nmon files kept for a month:
+.Dl jmon -f -s 60 --rotate --record-keep 30 --record-dir /var/log/jmon
+.Sh SEE ALSO
+.Xr netstat 1 ,
+.Xr systat 1 ,
+.Xr top 1 ,
+.Xr gstat 8 ,
+.Xr iostat 8 ,
+.Xr vmstat 8
+.Sh CAVEATS
+CPU temperatures need the
+.Xr coretemp 4
+or
+.Xr amdtemp 4
+driver.
+FreeBSD has no I/O wait time, so the nmon
+.Ql Wait%
+column is always zero.
+ZFS pool capacity comes from
+.Xr zpool 8
+and is refreshed every 30 seconds, or every 5 seconds while the pool is
+being written.

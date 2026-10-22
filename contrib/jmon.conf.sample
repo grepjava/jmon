@@ -1,0 +1,26 @@
+# jmon configuration. Keys are jmon's long option names (see jmon(1));
+# options on the command line override this file.
+
+# Seconds between samples.
+interval = 10
+
+# Push OpenTelemetry metrics to a Collector. Use https:// for TLS.
+#otlp-endpoint = "http://127.0.0.1:4317"
+#otlp-protocol = "grpc"           # or "http/protobuf", "http/json"
+#otlp-interval = 30
+#otlp-ca = "/usr/local/etc/ssl/collector-ca.pem"
+
+# Serve Prometheus metrics at http://<addr>/metrics.
+prometheus = "127.0.0.1:9464"
+
+# Export per-process metrics for the N busiest processes (high cardinality).
+#export-top = 10
+
+# Keep daily nmon recordings.
+#auto-record = true
+#record-dir = "/var/log/jmon"
+#rotate = true
+#record-keep = 30
+
+# Disk groups, shown with the `g` key and recorded as nmon DG* sections.
+#disk-group = ["mirror=ada0,ada1", "data=da0,da1,da2"]
