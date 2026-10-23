@@ -13,7 +13,7 @@ use ratatui::widgets::{Block, Borders, Paragraph};
 use ratatui::{DefaultTerminal, Frame};
 use std::collections::VecDeque;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Panel {
@@ -170,6 +170,23 @@ pub fn run(hub: Arc<Hub>, show: &str, status: Vec<String>, log: LogRing, groups:
     res
 }
 
+/// How often the whole screen is rewritten, not just the cells that changed.
+const REPAINT: Duration = Duration::from_secs(5);
+
+/// Makes the next draw rewrite every cell. ratatui only writes cells that
+/// changed, so anything else that writes to the terminal, such as kernel
+/// messages on the console, would stay on screen (and a scroll would shift
+/// everything) until those cells happened to change.
+fn invalidate(terminal: &mut DefaultTerminal) {
+    // Between draws the current buffer is the blank one the next frame goes
+    // into. Fill it with a symbol that's never drawn and swap, so it becomes
+    // the buffer the next frame is compared with and every cell differs.
+    for c in &mut terminal.current_buffer_mut().content {
+        c.set_symbol("\u{fffe}");
+    }
+    terminal.swap_buffers();
+}
+
 impl App {
     fn new(hub: Arc<Hub>, show: &str, status: Vec<String>, log: LogRing) -> App {
         let mut panels: Vec<Panel> = Vec::new();
@@ -201,6 +218,7 @@ impl App {
 
     fn run(&mut self, terminal: &mut DefaultTerminal) -> Result<()> {
         let mut dirty = true;
+        let mut last_repaint = Instant::now();
         loop {
             if self.hub.stopped() {
                 return Ok(());
@@ -216,12 +234,26 @@ impl App {
                 self.record(s);
                 dirty = true;
             }
+            if last_repaint.elapsed() >= REPAINT {
+                invalidate(terminal);
+                last_repaint = Instant::now();
+                dirty = true;
+            }
             if dirty {
                 terminal.draw(|f| self.draw(f, sample.as_deref()))?;
                 dirty = false;
             }
             if event::poll(Duration::from_millis(200))? {
                 match event::read()? {
+                    Event::Key(k)
+                        if k.kind == KeyEventKind::Press
+                            && k.modifiers.contains(KeyModifiers::CONTROL)
+                            && k.code == KeyCode::Char('l') =>
+                    {
+                        invalidate(terminal);
+                        last_repaint = Instant::now();
+                        dirty = true;
+                    }
                     Event::Key(k) if k.kind == KeyEventKind::Press => {
                         if !self.key(k.code, k.modifiers) {
                             self.hub.request_stop();
@@ -647,27 +679,25 @@ const HELP_MODES: &[(&str, &str)] = &[
     ("b", "Black & white"),
     ("0", "Reset CPU peaks (>)"),
     ("R", "Reset temperature peak"),
+    ("^L", "Redraw screen"),
     ("q", "Quit"),
 ];
 
 fn help_lines() -> Vec<Line<'static>> {
-    // One column width for every grid so the columns line up across sections.
-    let width = [HELP_PANELS, HELP_TOP, HELP_MODES]
-        .iter()
-        .flat_map(|g| g.iter())
-        .map(|(k, d)| k.chars().count() + 3 + d.chars().count())
-        .max()
-        .unwrap_or(0)
-        + 3;
+    // One column width for every grid so the columns line up across sections,
+    // and keys right-aligned so a two-character key like ^L doesn't shift its "=".
+    let entries = || [HELP_PANELS, HELP_TOP, HELP_MODES].into_iter().flatten();
+    let key_width = entries().map(|(k, _)| k.chars().count()).max().unwrap_or(0);
+    let width = entries().map(|(_, d)| key_width + 3 + d.chars().count()).max().unwrap_or(0) + 3;
     let grid = |entries: &[(&str, &str)]| -> Vec<Line<'static>> {
         entries
             .chunks(3)
             .map(|row| {
                 let mut spans = vec![Span::raw("  ")];
                 for (key, desc) in row {
-                    spans.push(Span::styled(key.to_string(), Style::default().add_modifier(Modifier::BOLD)));
+                    spans.push(Span::styled(format!("{key:>key_width$}"), Style::default().add_modifier(Modifier::BOLD)));
                     let text = format!(" = {desc}");
-                    let pad = width.saturating_sub(key.chars().count() + text.chars().count());
+                    let pad = width.saturating_sub(key_width + text.chars().count());
                     spans.push(Span::raw(format!("{text}{}", " ".repeat(pad))));
                 }
                 Line::from(spans)
@@ -1604,12 +1634,10 @@ mod tests {
     fn help_columns_line_up() {
         let text = |l: &Line| l.spans.iter().map(|s| s.content.to_string()).collect::<String>();
         let rows: Vec<String> = help_lines().iter().map(text).filter(|t| t.starts_with("  ")).collect();
-        // Every key in the second and third columns starts at the same offset.
-        let starts = |r: &String| -> Vec<usize> {
-            r.char_indices().filter(|&(i, c)| c == '=' && i > 4).map(|(i, _)| i).collect()
-        };
+        // The "=" after each key is at the same offset in every column.
+        let starts = |r: &String| -> Vec<usize> { r.char_indices().filter(|&(_, c)| c == '=').map(|(i, _)| i).collect() };
         let first = starts(&rows[0]);
-        assert_eq!(first.len(), 2);
+        assert_eq!(first.len(), 3);
         for r in &rows {
             let s = starts(r);
             assert_eq!(s, first[..s.len()], "misaligned: {r}");
