@@ -10,7 +10,8 @@ use ratatui::layout::{Constraint, Layout};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph};
-use ratatui::{DefaultTerminal, Frame};
+use ratatui::backend::Backend;
+use ratatui::{DefaultTerminal, Frame, Terminal};
 use std::collections::VecDeque;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -177,7 +178,7 @@ const REPAINT: Duration = Duration::from_secs(5);
 /// changed, so anything else that writes to the terminal, such as kernel
 /// messages on the console, would stay on screen (and a scroll would shift
 /// everything) until those cells happened to change.
-fn invalidate(terminal: &mut DefaultTerminal) {
+fn invalidate<B: Backend>(terminal: &mut Terminal<B>) {
     // Between draws the current buffer is the blank one the next frame goes
     // into. Fill it with a symbol that's never drawn and swap, so it becomes
     // the buffer the next frame is compared with and every cell differs.
@@ -218,6 +219,9 @@ impl App {
 
     fn run(&mut self, terminal: &mut DefaultTerminal) -> Result<()> {
         let mut dirty = true;
+        // The console has no alternate screen, so whatever was on it (the login
+        // banner, the shell) is still there; write the blank cells too.
+        invalidate(terminal);
         let mut last_repaint = Instant::now();
         loop {
             if self.hub.stopped() {
@@ -1608,9 +1612,21 @@ fn checks(s: &Sample) -> Vec<Line<'static>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ratatui::backend::TestBackend;
 
     fn width(spans: &[Span]) -> usize {
         spans.iter().map(|s| s.content.chars().count()).sum()
+    }
+
+    #[test]
+    fn invalidate_overwrites_leftover_text() {
+        // A screen already full of text that a new Terminal knows nothing about.
+        let mut before = Terminal::new(TestBackend::new(30, 4)).unwrap();
+        before.draw(|f| f.render_widget(Paragraph::new("Welcome to FreeBSD!\nmotd"), f.area())).unwrap();
+        let mut t = Terminal::new(before.backend().clone()).unwrap();
+        invalidate(&mut t);
+        t.draw(|f| f.render_widget(Paragraph::new("jmon"), f.area())).unwrap();
+        t.backend().assert_buffer_lines(["jmon                          ", "", "", ""]);
     }
 
     #[test]
