@@ -216,7 +216,7 @@ fn main() -> Result<()> {
 
     if screen {
         // Signals stop the screen through the hub so it can restore the terminal.
-        rt.spawn(wait_for_shutdown(hub.clone()));
+        rt.spawn(wait_for_shutdown(hub.clone(), false));
         tui::run(
             hub.clone(),
             &cli.show,
@@ -228,7 +228,7 @@ fn main() -> Result<()> {
         )?;
     } else {
         info!("jmon {} running headless, interval {}s", env!("CARGO_PKG_VERSION"), cli.interval);
-        rt.block_on(wait_for_shutdown(hub.clone()));
+        rt.block_on(wait_for_shutdown(hub.clone(), true));
     }
 
     hub.request_stop();
@@ -270,9 +270,11 @@ fn reload_config(hub: &Hub) {
     }
 }
 
-/// Waits for SIGINT, SIGTERM, or the sampler finishing, then asks everything to
-/// stop. On Unix, SIGHUP reloads the configuration file without stopping.
-async fn wait_for_shutdown(hub: Arc<Hub>) {
+/// Waits for SIGINT, SIGTERM, SIGHUP, or the sampler finishing, then asks
+/// everything to stop. Headless (`reload_on_hup`), SIGHUP instead reloads the
+/// configuration file; with the screen up it means the terminal went away.
+#[cfg_attr(not(unix), allow(unused_variables))]
+async fn wait_for_shutdown(hub: Arc<Hub>, reload_on_hup: bool) {
     let stopped = {
         let hub = hub.clone();
         async move {
@@ -290,7 +292,12 @@ async fn wait_for_shutdown(hub: Arc<Hub>) {
                 (Ok(mut term), Ok(mut hup)) => loop {
                     tokio::select! {
                         _ = term.recv() => break "SIGTERM",
-                        _ = hup.recv() => reload_config(&hub),
+                        _ = hup.recv() => {
+                            if !reload_on_hup {
+                                break "SIGHUP";
+                            }
+                            reload_config(&hub);
+                        }
                     }
                 },
                 _ => std::future::pending().await,

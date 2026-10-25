@@ -91,19 +91,13 @@ pub fn init(cfg: &OtelConfig, hub: Arc<Hub>, host: &HostInfo, rt: &tokio::runtim
             {
                 use opentelemetry_otlp::WithTonicConfig;
                 use opentelemetry_otlp::tonic_types::transport::{Certificate, ClientTlsConfig};
-                let is_https = cfg
-                    .endpoint
-                    .as_deref()
-                    .or_else(|| None)
-                    .map_or_else(
-                        || {
-                            ["OTEL_EXPORTER_OTLP_METRICS_ENDPOINT", "OTEL_EXPORTER_OTLP_ENDPOINT"]
-                                .iter()
-                                .find_map(|k| std::env::var(k).ok())
-                                .is_some_and(|u| u.starts_with("https://"))
-                        },
-                        |u| u.starts_with("https://"),
-                    );
+                // Without --otlp-endpoint the exporter falls back to the standard variables.
+                let endpoint = cfg.endpoint.clone().or_else(|| {
+                    ["OTEL_EXPORTER_OTLP_METRICS_ENDPOINT", "OTEL_EXPORTER_OTLP_ENDPOINT"]
+                        .iter()
+                        .find_map(|k| std::env::var(k).ok())
+                });
+                let is_https = endpoint.is_some_and(|u| u.starts_with("https://"));
                 if let Some(pem) = &ca {
                     let tls = ClientTlsConfig::new().with_native_roots().ca_certificate(Certificate::from_pem(pem));
                     b = b.with_tls_config(tls);

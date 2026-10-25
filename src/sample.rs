@@ -570,6 +570,7 @@ impl Hub {
         self.top_procs.load(Ordering::Relaxed)
     }
 
+    #[cfg_attr(not(unix), allow(dead_code))]
     pub fn set_top_procs(&self, top_procs: usize) {
         self.top_procs.store(top_procs, Ordering::Relaxed);
     }

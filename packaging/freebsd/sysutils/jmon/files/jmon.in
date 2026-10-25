@@ -9,6 +9,8 @@
 #   sysrc jmon_enable=YES
 #   service jmon start
 #
+# `service jmon reload` rereads the config file's interval and export-top.
+#
 # Optional rc.conf variables:
 #   jmon_runas="nobody"        unprivileged user to run as
 #   jmon_flags=""              extra command-line options (override the config file)
@@ -32,5 +34,15 @@ command="/usr/sbin/daemon"
 command_args="-f -r -P ${pidfile} -u ${jmon_runas} %%PREFIX%%/bin/jmon -d --syslog ${jmon_flags}"
 # rc.subr would otherwise also pass jmon_flags to daemon(8) itself.
 jmon_flags=""
+
+# The pidfile is daemon(8)'s, which doesn't pass SIGHUP on; signal its child.
+extra_commands="reload"
+reload_cmd="jmon_reload"
+jmon_reload()
+{
+	rc_pid=$(check_pidfile ${pidfile} ${command})
+	[ -n "${rc_pid}" ] || { echo "${name} is not running."; return 1; }
+	pkill -HUP -P ${rc_pid}
+}
 
 run_rc_command "$1"

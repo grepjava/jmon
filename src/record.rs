@@ -86,8 +86,8 @@ impl Recorder {
     }
 
     fn open_new(cfg: &RecordSettings, host: &HostInfo) -> io::Result<(PathBuf, Box<dyn Sink>)> {
-        let path = cfg.dir.join(auto_name(host, cfg.format));
-        let out = io::BufWriter::new(std::fs::File::create(&path)?);
+        let (path, file) = create_unique(&cfg.dir, &auto_name(host, cfg.format))?;
+        let out = io::BufWriter::new(file);
         let sink: Box<dyn Sink> = match cfg.format {
             Format::Nmon => Box::new(Nmon::new(out, cfg.interval, cfg.count, cfg.groups.clone())),
             Format::Jsonl => Box::new(JsonLines::new(out)),
@@ -117,6 +117,24 @@ impl Recorder {
             }
         }
     }
+}
+
+/// Creates `dir/name`, or `name` with `_2`, `_3`, ... before the extension if
+/// that exists. Names only go down to the minute, so a second recorder (the
+/// screen's `w` next to `-f`, or both rotating at midnight) must not truncate
+/// the first one's file.
+fn create_unique(dir: &Path, name: &str) -> io::Result<(PathBuf, std::fs::File)> {
+    let (stem, ext) = name.rsplit_once('.').unwrap_or((name, ""));
+    for n in 1..1000 {
+        let candidate = if n == 1 { name.to_string() } else { format!("{stem}_{n}.{ext}") };
+        let path = dir.join(candidate);
+        match std::fs::OpenOptions::new().write(true).create_new(true).open(&path) {
+            Ok(f) => return Ok((path, f)),
+            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(e),
+        }
+    }
+    Err(io::Error::new(io::ErrorKind::AlreadyExists, format!("no free recording name for {name}")))
 }
 
 fn compress_file(path: PathBuf) {
@@ -603,6 +621,21 @@ mod tests {
     use super::*;
     use crate::model::{Process, Snapshot};
     use std::time::Duration;
+
+    #[test]
+    fn recordings_never_truncate_an_existing_file() {
+        let dir = std::env::temp_dir().join(format!("jmon-unique-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let (a, mut fa) = create_unique(&dir, "box_261026_1200.nmon").unwrap();
+        fa.write_all(b"first").unwrap();
+        let (b, _) = create_unique(&dir, "box_261026_1200.nmon").unwrap();
+        let (c, _) = create_unique(&dir, "box_261026_1200.nmon").unwrap();
+        assert_eq!(a.file_name().unwrap(), "box_261026_1200.nmon");
+        assert_eq!(b.file_name().unwrap(), "box_261026_1200_2.nmon");
+        assert_eq!(c.file_name().unwrap(), "box_261026_1200_3.nmon");
+        assert_eq!(std::fs::read(&a).unwrap(), b"first");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
 
     #[test]
     fn nmon_splits_user_sys_cpu_and_emits_uarg_on_pid_reuse() {

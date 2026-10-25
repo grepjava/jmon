@@ -104,7 +104,7 @@ sysrc jmon_enable=YES
 service jmon start
 ```
 
-The service runs as `nobody` under daemon(8), which restarts it if it exits. Logs go to syslog: info messages land in `/var/log/daemon.log`, and warnings also reach `/var/log/messages`.
+The service runs as `nobody` under daemon(8), which restarts it if it exits. `service jmon reload` rereads the config file's `interval` and `export-top` without a restart. Logs go to syslog: info messages land in `/var/log/daemon.log`, and warnings also reach `/var/log/messages`.
 
 ## Metrics
 

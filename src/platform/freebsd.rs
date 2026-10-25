@@ -69,61 +69,70 @@ fn sysctl_mib_raw(mib: &[libc::c_int]) -> io::Result<Vec<u8>> {
     Err(io::Error::from_raw_os_error(libc::ENOMEM))
 }
 
-/// Reads an integer sysctl that may be `int`, `u_int`, `long` or `uint64_t`
-/// in a single syscall using a stack buffer.
+/// An `int`, `u_int`, `long` or `uint64_t` sysctl, read in one syscall into a
+/// stack buffer.
+struct SysctlNum {
+    buf: [u8; 8],
+    len: usize,
+}
+
+impl SysctlNum {
+    /// `call` runs sysctl(3) or sysctlbyname(3) on the buffer and its length.
+    fn read(call: impl FnOnce(*mut libc::c_void, &mut libc::size_t) -> libc::c_int) -> io::Result<Self> {
+        let mut buf = [0u8; 8];
+        let mut len: libc::size_t = buf.len();
+        if call(buf.as_mut_ptr().cast(), &mut len) != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(SysctlNum { buf, len })
+    }
+
+    fn by_name(name: &str) -> io::Result<Self> {
+        let cname = CString::new(name).map_err(|_| io::ErrorKind::InvalidInput)?;
+        Self::read(|p, len| unsafe { libc::sysctlbyname(cname.as_ptr(), p, len, std::ptr::null(), 0) })
+    }
+
+    fn by_mib(mib: &[libc::c_int]) -> io::Result<Self> {
+        if mib.is_empty() {
+            return Err(io::Error::from_raw_os_error(libc::ENOENT));
+        }
+        Self::read(|p, len| unsafe { libc::sysctl(mib.as_ptr(), mib.len() as u32, p, len, std::ptr::null(), 0) })
+    }
+
+    fn unsigned(&self) -> io::Result<u64> {
+        match self.len {
+            4 => Ok(u32::from_ne_bytes(self.buf[..4].try_into().unwrap()) as u64),
+            8 => Ok(u64::from_ne_bytes(self.buf)),
+            n => Err(io::Error::new(io::ErrorKind::InvalidData, format!("unexpected size {n}"))),
+        }
+    }
+
+    fn signed(&self) -> Option<i64> {
+        match self.len {
+            4 => Some(i32::from_ne_bytes(self.buf[..4].try_into().unwrap()) as i64),
+            8 => Some(i64::from_ne_bytes(self.buf)),
+            _ => None,
+        }
+    }
+}
+
 fn sysctl_uint(name: &str) -> io::Result<u64> {
-    let cname = CString::new(name).map_err(|_| io::ErrorKind::InvalidInput)?;
-    let mut buf = [0u8; 8];
-    let mut len: libc::size_t = buf.len();
-    let rc = unsafe {
-        libc::sysctlbyname(cname.as_ptr(), buf.as_mut_ptr().cast(), &mut len, std::ptr::null(), 0)
-    };
-    if rc != 0 {
-        return Err(io::Error::last_os_error());
-    }
-    match len {
-        4 => Ok(u32::from_ne_bytes(buf[..4].try_into().unwrap()) as u64),
-        8 => Ok(u64::from_ne_bytes(buf)),
-        n => Err(io::Error::new(io::ErrorKind::InvalidData, format!("{name}: unexpected size {n}"))),
-    }
+    SysctlNum::by_name(name)?.unsigned().map_err(|e| io::Error::new(e.kind(), format!("{name}: {e}")))
+}
+
+fn sysctl_int(name: &str) -> Option<i64> {
+    SysctlNum::by_name(name).ok()?.signed()
 }
 
 fn sysctl_mib_uint(mib: &[libc::c_int]) -> io::Result<u64> {
-    if mib.is_empty() {
-        return Err(io::Error::from_raw_os_error(libc::ENOENT));
-    }
-    let mut buf = [0u8; 8];
-    let mut len: libc::size_t = buf.len();
-    let rc = unsafe {
-        libc::sysctl(mib.as_ptr(), mib.len() as u32, buf.as_mut_ptr().cast(), &mut len, std::ptr::null(), 0)
-    };
-    if rc != 0 {
-        return Err(io::Error::last_os_error());
-    }
-    match len {
-        4 => Ok(u32::from_ne_bytes(buf[..4].try_into().unwrap()) as u64),
-        8 => Ok(u64::from_ne_bytes(buf)),
-        n => Err(io::Error::new(io::ErrorKind::InvalidData, format!("mib: unexpected size {n}"))),
-    }
+    SysctlNum::by_mib(mib)?.unsigned()
 }
 
-fn sysctl_mib_int(mib: &[libc::c_int]) -> Option<i64> {
-    if mib.is_empty() {
-        return None;
-    }
-    let mut buf = [0u8; 8];
-    let mut len: libc::size_t = buf.len();
-    let rc = unsafe {
-        libc::sysctl(mib.as_ptr(), mib.len() as u32, buf.as_mut_ptr().cast(), &mut len, std::ptr::null(), 0)
-    };
-    if rc != 0 {
-        return None;
-    }
-    match len {
-        4 => Some(i32::from_ne_bytes(buf[..4].try_into().unwrap()) as i64),
-        8 => Some(i64::from_ne_bytes(buf)),
-        _ => None,
-    }
+/// Temperature sysctls ("IK" format) are tenths of a kelvin; sysctl(8)
+/// converts with a 273.1 offset, so match it.
+fn deci_kelvin_to_celsius(raw: u64) -> Option<f64> {
+    let v = raw as u32 as i32;
+    (v > 0).then(|| (v - 2731) as f64 / 10.0)
 }
 
 /// Pre-resolved sysctl OID so hot-path reads skip ASCII name resolution in the kernel.
@@ -142,6 +151,10 @@ impl Mib {
         }
     }
 
+    fn found(&self) -> bool {
+        !self.0.is_empty()
+    }
+
     fn uint(&self) -> io::Result<u64> {
         sysctl_mib_uint(&self.0)
     }
@@ -151,12 +164,11 @@ impl Mib {
     }
 
     fn int(&self) -> Option<i64> {
-        sysctl_mib_int(&self.0)
+        SysctlNum::by_mib(&self.0).ok()?.signed()
     }
 
     fn celsius(&self) -> Option<f64> {
-        let v = self.uint().ok()? as u32 as i32;
-        (v > 0).then(|| (v - 2731) as f64 / 10.0)
+        deci_kelvin_to_celsius(self.uint().ok()?)
     }
 
     fn raw(&self) -> io::Result<Vec<u8>> {
@@ -261,6 +273,8 @@ pub struct Collector {
     nfs_cache: Option<(Vec<u8>, Nfs)>,
     /// Battery sysctls run ACPI methods (~4 ms each), so read them rarely.
     battery: Option<(Instant, Option<Battery>)>,
+    /// When the sensor OIDs were last resolved, so a driver loaded later is found.
+    sensor_lookup: Instant,
     geom: Option<GeomStats>,
     warned: std::collections::HashSet<&'static str>,
 }
@@ -327,7 +341,7 @@ struct Mibs {
 
 impl Mibs {
     fn new(ncpu: usize) -> Self {
-        Mibs {
+        let mut mibs = Mibs {
             cp_times: Mib::lookup("kern.cp_times"),
             devstat_all: Mib::lookup("kern.devstat.all"),
             vmtotal: Mib::lookup("vm.vmtotal"),
@@ -377,10 +391,25 @@ impl Mibs {
             arc_l2_size: Mib::lookup("kstat.zfs.misc.arcstats.l2_size"),
             arc_l2_hits: Mib::lookup("kstat.zfs.misc.arcstats.l2_hits"),
             arc_l2_misses: Mib::lookup("kstat.zfs.misc.arcstats.l2_misses"),
-            cpu_temps: (0..ncpu).map(|i| Mib::lookup(&format!("dev.cpu.{i}.temperature"))).collect(),
-            cpu_freqs: (0..ncpu).map(|i| Mib::lookup(&format!("dev.cpu.{i}.freq"))).collect(),
-            cpu_tjmax: Mib::lookup("dev.cpu.0.coretemp.tjmax"),
-        }
+            cpu_temps: Vec::new(),
+            cpu_freqs: Vec::new(),
+            cpu_tjmax: Mib::default(),
+        };
+        mibs.resolve_sensors(ncpu);
+        mibs
+    }
+
+    /// (Re)resolves the per-CPU sensor OIDs, which only exist once coretemp(4)
+    /// or cpufreq(4) is loaded.
+    fn resolve_sensors(&mut self, ncpu: usize) {
+        self.cpu_temps = (0..ncpu).map(|i| Mib::lookup(&format!("dev.cpu.{i}.temperature"))).collect();
+        self.cpu_freqs = (0..ncpu).map(|i| Mib::lookup(&format!("dev.cpu.{i}.freq"))).collect();
+        self.cpu_tjmax = Mib::lookup("dev.cpu.0.coretemp.tjmax");
+    }
+
+    fn sensors_missing(&self) -> bool {
+        let first_missing = |v: &[Mib]| v.first().is_none_or(|m| !m.found());
+        first_missing(&self.cpu_temps) || first_missing(&self.cpu_freqs)
     }
 }
 
@@ -388,6 +417,7 @@ impl Mibs {
 const ZPOOL_REFRESH: Duration = Duration::from_secs(30);
 const ZPOOL_REFRESH_BUSY: Duration = Duration::from_secs(5);
 const BATTERY_REFRESH: Duration = Duration::from_secs(30);
+const SENSOR_LOOKUP: Duration = Duration::from_secs(60);
 
 struct ZpoolCache {
     at: Instant,
@@ -426,6 +456,7 @@ impl Collector {
             zpools: None,
             nfs_cache: None,
             battery: None,
+            sensor_lookup: Instant::now(),
             geom: None,
             warned: Default::default(),
         })
@@ -527,6 +558,10 @@ impl Collector {
     fn sensors(&mut self) -> Sensors {
         if self.battery.as_ref().is_none_or(|(t, _)| t.elapsed() >= BATTERY_REFRESH) {
             self.battery = Some((Instant::now(), battery()));
+        }
+        if self.mibs.sensors_missing() && self.sensor_lookup.elapsed() >= SENSOR_LOOKUP {
+            self.sensor_lookup = Instant::now();
+            self.mibs.resolve_sensors(self.host.ncpu);
         }
         let mut s = sensors(&self.mibs);
         s.battery = self.battery.as_ref().and_then(|(_, b)| b.clone());
@@ -951,28 +986,8 @@ fn proc_args(pid: i32) -> Option<String> {
 // ---------------------------------------------------------------------------
 // Sensors
 
-/// Temperature sysctls ("IK" format) are tenths of a kelvin; sysctl(8)
-/// converts with a 273.1 offset, so match it.
 fn sysctl_celsius(name: &str) -> Option<f64> {
-    let v = sysctl_uint(name).ok()? as u32 as i32;
-    (v > 0).then(|| (v - 2731) as f64 / 10.0)
-}
-
-fn sysctl_int(name: &str) -> Option<i64> {
-    let cname = CString::new(name).ok()?;
-    let mut buf = [0u8; 8];
-    let mut len: libc::size_t = buf.len();
-    let rc = unsafe {
-        libc::sysctlbyname(cname.as_ptr(), buf.as_mut_ptr().cast(), &mut len, std::ptr::null(), 0)
-    };
-    if rc != 0 {
-        return None;
-    }
-    match len {
-        4 => Some(i32::from_ne_bytes(buf[..4].try_into().unwrap()) as i64),
-        8 => Some(i64::from_ne_bytes(buf)),
-        _ => None,
-    }
+    deci_kelvin_to_celsius(sysctl_uint(name).ok()?)
 }
 
 fn sensors(mibs: &Mibs) -> Sensors {
@@ -1046,10 +1061,11 @@ fn udp(mibs: &Mibs) -> Option<Udp> {
     parse_udp(&mibs.udp_stats.raw().ok()?)
 }
 
-/// `struct udpstat` from <netinet/udp_var.h>: uint64_t counters.
+/// `struct udpstat` from <netinet/udp_var.h>: uint64_t counters. Index 8 and
+/// 9 are the pcb cache/hash misses; output counters start at 10.
 pub(crate) fn parse_udp(stats: &[u8]) -> Option<Udp> {
     let v: Vec<u64> = stats.as_chunks::<8>().0.iter().map(|c| u64::from_ne_bytes(*c)).collect();
-    if v.len() <= 9 {
+    if v.len() <= 10 {
         return None;
     }
     Some(Udp {
@@ -1057,7 +1073,7 @@ pub(crate) fn parse_udp(stats: &[u8]) -> Option<Udp> {
         in_errors: v[1].saturating_add(v[2]).saturating_add(v[4]),
         no_ports: v[5],
         full_socket_buffers: v[7],
-        datagrams_out: v[9],
+        datagrams_out: v[10],
     })
 }
 
@@ -1524,7 +1540,9 @@ mod fixtures_more {
     #[test]
     fn udpstat_counters() {
         let mut raw = Vec::new();
-        for v in [100u64, 1, 2, 0, 3, 5, 0, 7, 0, 200] {
+        // ipackets, hdrops, badsum, nosum, badlen, noport, noportbcast,
+        // fullsock, pcbcachemiss, pcbhashmiss, opackets
+        for v in [100u64, 1, 2, 0, 3, 5, 0, 7, 9, 11, 200] {
             raw.extend_from_slice(&v.to_ne_bytes());
         }
         let u = parse_udp(&raw).unwrap();
@@ -1533,6 +1551,6 @@ mod fixtures_more {
         assert_eq!(u.no_ports, 5);
         assert_eq!(u.full_socket_buffers, 7);
         assert_eq!(u.datagrams_out, 200);
-        assert!(parse_udp(&[0u8; 32]).is_none());
+        assert!(parse_udp(&raw[..80]).is_none());
     }
 }

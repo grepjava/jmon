@@ -14,6 +14,7 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph, Widget};
 use ratatui::{DefaultTerminal, Frame, Terminal};
+use std::cell::Cell;
 use std::collections::VecDeque;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -150,6 +151,8 @@ struct App {
     input: Option<(InputKind, String)>,
     /// Vertical scroll offset (rows).
     scroll: usize,
+    /// Largest useful `scroll` as of the last draw (unbounded before the first).
+    max_scroll: Cell<usize>,
     history: VecDeque<CpuUtil>,
     /// Hottest CPU reading since start (or the last reset): (Celsius, unix time).
     temp_peak: Option<(f64, f64)>,
@@ -232,6 +235,7 @@ impl App {
             search_filter: None,
             input: None,
             scroll: 0,
+            max_scroll: Cell::new(usize::MAX),
             history: VecDeque::with_capacity(HISTORY),
             temp_peak: None,
             cpu_peaks: Vec::new(),
@@ -351,12 +355,12 @@ impl App {
         }
         match code {
             KeyCode::Char('q') | KeyCode::Esc => return false,
-            KeyCode::Up | KeyCode::Char('[') => self.scroll = self.scroll.saturating_sub(1),
-            KeyCode::Down | KeyCode::Char(']') => self.scroll = self.scroll.saturating_add(1),
-            KeyCode::PageUp => self.scroll = self.scroll.saturating_sub(10),
-            KeyCode::PageDown => self.scroll = self.scroll.saturating_add(10),
+            KeyCode::Up | KeyCode::Char('[') => self.scroll_to(self.scroll.saturating_sub(1)),
+            KeyCode::Down | KeyCode::Char(']') => self.scroll_to(self.scroll.saturating_add(1)),
+            KeyCode::PageUp => self.scroll_to(self.scroll.saturating_sub(10)),
+            KeyCode::PageDown => self.scroll_to(self.scroll.saturating_add(10)),
             KeyCode::Home => self.scroll = 0,
-            KeyCode::End => self.scroll = usize::MAX / 2,
+            KeyCode::End => self.scroll_to(usize::MAX),
             KeyCode::Char('+') => self.hub.set_interval(self.hub.interval() * 2),
             KeyCode::Char('-') => self.hub.set_interval(self.hub.interval() / 2),
             KeyCode::Char('3') => self.sort = TopSort::Cpu,
@@ -394,6 +398,10 @@ impl App {
             _ => {}
         }
         true
+    }
+
+    fn scroll_to(&mut self, row: usize) {
+        self.scroll = row.min(self.max_scroll.get());
     }
 
     fn toggle_recording(&mut self) {
@@ -504,13 +512,6 @@ impl App {
         };
 
         if panels_fit {
-            if self.scroll > 0
-                && let Some((_, lines)) = contents.iter_mut().find(|(p, _)| *p == Panel::Top)
-                && lines.len() > 2
-            {
-                let skip = self.scroll.min(lines.len().saturating_sub(2));
-                lines.drain(1..=skip);
-            }
             let constraints: Vec<Constraint> = contents
                 .iter()
                 .map(|(p, lines)| match p {
@@ -519,6 +520,18 @@ impl App {
                 })
                 .collect();
             let areas = Layout::vertical(constraints).split(body);
+            // Only the process list scrolls; its header row stays put.
+            let mut max_scroll = 0;
+            if let Some(i) = contents.iter().position(|(p, _)| *p == Panel::Top) {
+                let lines = &mut contents[i].1;
+                let rows = (areas[i].height as usize).saturating_sub(3);
+                max_scroll = lines.len().saturating_sub(1).saturating_sub(rows);
+                let skip = self.scroll.min(max_scroll);
+                if skip > 0 {
+                    lines.drain(1..=skip);
+                }
+            }
+            self.max_scroll.set(max_scroll);
             for ((p, lines), area) in contents.into_iter().zip(areas.iter()) {
                 let block = Block::default()
                     .borders(Borders::ALL)
@@ -553,6 +566,7 @@ impl App {
                 Paragraph::new(lines).block(block).render(*area, &mut vbuf);
             }
             let max_scroll = total_h.saturating_sub(body.height) as usize;
+            self.max_scroll.set(max_scroll);
             let offset = self.scroll.min(max_scroll) as u16;
             let dst = f.buffer_mut();
             for y in 0..body.height {
@@ -603,8 +617,9 @@ impl App {
         if let Some(q) = &self.search_filter {
             spans.push(Span::raw(format!(" │ filter={q}")));
         }
-        if self.scroll > 0 {
-            spans.push(Span::raw(format!(" │ +{} lines", self.scroll)));
+        let scroll = self.scroll.min(self.max_scroll.get());
+        if scroll > 0 {
+            spans.push(Span::raw(format!(" │ +{scroll} lines")));
         }
         Paragraph::new(Line::from(spans)).style(Style::default().add_modifier(Modifier::REVERSED))
     }
@@ -613,7 +628,7 @@ impl App {
         if let Some((kind, buf)) = &self.input {
             let prompt = match kind {
                 InputKind::User => " Show processes of user: ",
-                InputKind::Search => " Filter processes (command/args/jail): ",
+                InputKind::Search => " Filter processes (command/args/user/jail/PID): ",
             };
             return Paragraph::new(Line::from(vec![
                 Span::styled(prompt, Style::default().add_modifier(Modifier::REVERSED)),
@@ -812,7 +827,7 @@ const HELP_TOP: &[(&str, &str)] = &[
     ("5", "Sort by I/O"),
     ("a", "Full command lines"),
     ("u", "Filter by user"),
-    ("/", "Search command/jail"),
+    ("/", "Search processes"),
 ];
 
 const HELP_MODES: &[(&str, &str)] = &[
@@ -1950,6 +1965,17 @@ mod render_tests {
                     app.history.push_back(s.rates.as_ref().unwrap().cpu_total);
                 }
                 let mut t = Terminal::new(TestBackend::new(w, h)).unwrap();
+                t.draw(|f| app.draw(f, Some(&s))).unwrap();
+                // Scrolling stops at the last row and comes straight back.
+                app.key(KeyCode::End, KeyModifiers::NONE);
+                let max = app.scroll;
+                assert!(max < 200, "{w}x{h}: scroll {max}");
+                app.key(KeyCode::Down, KeyModifiers::NONE);
+                assert_eq!(app.scroll, max);
+                if max > 0 {
+                    app.key(KeyCode::Up, KeyModifiers::NONE);
+                    assert_eq!(app.scroll, max - 1);
+                }
                 t.draw(|f| app.draw(f, Some(&s))).unwrap();
                 if w == 170 && !busy && std::env::var("JMON_DUMP").is_ok() {
                     let buf = t.backend().buffer();

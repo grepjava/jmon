@@ -168,6 +168,7 @@ With
 .Fl -rotate ,
 compress finished daily files with
 .Xr gzip 1 .
+The file being written when jmon stops is left uncompressed.
 .It Fl -record-keep Ar days
 With
 .Fl -rotate ,
@@ -226,6 +227,18 @@ Append log messages to
 .Sh CONFIGURATION FILE
 The configuration file uses the long option names as keys.
 Options given on the command line override the file.
+Sending
+.Dv SIGHUP
+to jmon running without the screen (for example with
+.Ql service jmon reload )
+rereads the file and applies a new
+.Cm interval
+and
+.Cm export-top ;
+other changes need a restart.
+With the screen up,
+.Dv SIGHUP
+stops jmon.
 .Bd -literal -offset indent
 # /usr/local/etc/jmon.conf
 interval = 10
