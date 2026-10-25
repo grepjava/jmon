@@ -3,6 +3,7 @@
 //! semantic conventions; FreeBSD-only signals live under `freebsd.*`.
 
 use crate::sample::{Sample, SelfStats};
+use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -102,6 +103,7 @@ catalog! {
     FsUtilization => "system.filesystem.utilization", "1", Gauge, "Fraction of filesystem space used.";
     Uptime => "system.uptime", "s", Gauge, "Seconds since boot.";
     ProcCpu => "process.cpu.utilization", "1", Gauge, "CPU used by the busiest processes, as a fraction of one CPU.";
+    ProcCpuTime => "process.cpu.time", "s", Counter, "User and system CPU time of the busiest processes.";
     ProcMem => "process.memory.usage", "By", UpDown, "Resident set size of the busiest processes.";
     ProcVirt => "process.memory.virtual", "By", UpDown, "Virtual size of the busiest processes.";
     ProcDiskOps => "process.disk.operations", "{operation}", Counter, "Block I/O operations of the busiest processes.";
@@ -111,6 +113,9 @@ catalog! {
     TcpListenDrops => "freebsd.tcp.listen_queue_overflows", "{connection}", Counter, "Connections dropped because a listen queue was full.";
     TcpAccepts => "freebsd.tcp.accepts", "{connection}", Counter, "Inbound TCP connections accepted.";
     TcpConnAttempts => "freebsd.tcp.connect_attempts", "{connection}", Counter, "Outbound TCP connections initiated.";
+    UdpDatagrams => "freebsd.udp.datagrams", "{datagram}", Counter, "UDP datagrams sent and received.";
+    UdpErrors => "freebsd.udp.errors", "{error}", Counter, "UDP packets dropped due to header or checksum errors.";
+    UdpDropped => "freebsd.udp.dropped", "{datagram}", Counter, "UDP datagrams dropped (no socket or full buffer).";
     CpuTemp => "hw.temperature", "Cel", Gauge, "Temperature of each CPU core and ACPI thermal zone.";
     CpuFreq => "system.cpu.frequency", "Hz", Gauge, "Current clock frequency of each CPU that reports one.";
     Threads => "freebsd.threads.count", "{thread}", UpDown, "Threads by scheduling state (vmstat's r/b/w).";
@@ -132,6 +137,7 @@ catalog! {
     JailCpu => "freebsd.jail.cpu.utilization", "1", Gauge, "CPU used by each jail's processes, as a fraction of one CPU.";
     JailMem => "freebsd.jail.memory.usage", "By", UpDown, "Resident memory of each jail's processes.";
     JailProcs => "freebsd.jail.process.count", "{process}", UpDown, "Processes in each jail.";
+    JailIo => "freebsd.jail.io.operations", "{operation}", Gauge, "Block I/O operations per second of each jail's processes.";
     VmCpu => "freebsd.bhyve.cpu.utilization", "1", Gauge, "CPU used by each bhyve VM, as a fraction of one CPU.";
     VmMem => "freebsd.bhyve.memory.usage", "By", UpDown, "Resident memory of each bhyve VM process.";
     ArcTarget => "freebsd.zfs.arc.target_size", "By", UpDown, "ZFS ARC target size (c).";
@@ -321,6 +327,14 @@ pub fn collect(s: &Sample, top_procs: usize, stats: &SelfStats) -> Families {
         b.add(M::TcpConnAttempts, vec![], t.conn_attempts as f64);
     }
 
+    if let Some(u) = &snap.udp {
+        b.add(M::UdpDatagrams, vec![("network.io.direction", "receive".into())], u.datagrams_in as f64);
+        b.add(M::UdpDatagrams, vec![("network.io.direction", "transmit".into())], u.datagrams_out as f64);
+        b.add(M::UdpErrors, vec![], u.in_errors as f64);
+        b.add(M::UdpDropped, vec![("freebsd.udp.drop_reason", "no_port".into())], u.no_ports as f64);
+        b.add(M::UdpDropped, vec![("freebsd.udp.drop_reason", "full_buffer".into())], u.full_socket_buffers as f64);
+    }
+
     let sensors = &snap.sensors;
     for (i, mhz) in sensors.cpu_freqs_mhz.iter().enumerate() {
         b.add(M::CpuFreq, vec![("cpu.logical_number", Val::Int(i as i64))], *mhz as f64 * 1e6);
@@ -399,6 +413,7 @@ pub fn collect(s: &Sample, top_procs: usize, stats: &SelfStats) -> Families {
             b.add(M::JailCpu, attrs(), j.cpu / 100.0);
             b.add(M::JailMem, attrs(), j.rss as f64);
             b.add(M::JailProcs, attrs(), j.processes as f64);
+            b.add(M::JailIo, attrs(), j.io);
         }
         for v in &r.vms {
             let attrs = || vec![("freebsd.bhyve.vm.name", Val::from(v.name.clone()))];
@@ -419,6 +434,11 @@ pub fn collect(s: &Sample, top_procs: usize, stats: &SelfStats) -> Families {
                     ]
                 };
                 b.add(M::ProcCpu, attrs(), r.proc_cpu[i] / 100.0);
+                for (mode, us) in [("user", p.user_time_us), ("system", p.sys_time_us)] {
+                    let mut a = attrs();
+                    a.push(("cpu.mode", mode.into()));
+                    b.add(M::ProcCpuTime, a, us as f64 / 1e6);
+                }
                 b.add(M::ProcMem, attrs(), p.rss as f64);
                 b.add(M::ProcVirt, attrs(), p.vsize as f64);
                 let mut a = attrs();
@@ -436,6 +456,30 @@ pub fn collect(s: &Sample, top_procs: usize, stats: &SelfStats) -> Families {
         }
     }
     b.0
+}
+
+/// Returns `base` with `SelfExports` and `SelfScrapes` updated from live atomics.
+pub fn with_live_self_stats(base: Arc<Families>, stats: &SelfStats) -> Arc<Families> {
+    let ok = stats.export_ok.load(Ordering::Relaxed);
+    let failed = stats.export_failed.load(Ordering::Relaxed);
+    let scrapes = stats.scrapes.load(Ordering::Relaxed);
+    let cur_scrapes = base[M::SelfScrapes as usize].first().map_or(0, |p| p.value as u64);
+    let cur_ok = base[M::SelfExports as usize].first().map_or(0, |p| p.value as u64);
+    let cur_failed = base[M::SelfExports as usize].get(1).map_or(0, |p| p.value as u64);
+    if scrapes == cur_scrapes && ok == cur_ok && failed == cur_failed {
+        return base;
+    }
+    let mut fams = (*base).clone();
+    fams[M::SelfExports as usize].clear();
+    if ok + failed > 0 {
+        fams[M::SelfExports as usize].push(Point { attrs: vec![("result", "success".into())], value: ok as f64 });
+        fams[M::SelfExports as usize].push(Point { attrs: vec![("result", "failure".into())], value: failed as f64 });
+    }
+    fams[M::SelfScrapes as usize].clear();
+    if scrapes > 0 {
+        fams[M::SelfScrapes as usize].push(Point { attrs: vec![], value: scrapes as f64 });
+    }
+    Arc::new(fams)
 }
 
 #[cfg(test)]

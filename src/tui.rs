@@ -3,16 +3,19 @@
 
 use crate::logring::LogRing;
 use crate::model::{DiskGroup, Snapshot};
+use crate::record::{Format, RecordSettings, Recorder};
 use crate::sample::{CpuUtil, DiskRate, GroupRate, Hub, Rates, Sample, group_rates};
 use anyhow::Result;
+use ratatui::backend::Backend;
+use ratatui::buffer::Buffer;
 use ratatui::crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
-use ratatui::layout::{Constraint, Layout};
+use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Paragraph};
-use ratatui::backend::Backend;
+use ratatui::widgets::{Block, Borders, Paragraph, Widget};
 use ratatui::{DefaultTerminal, Frame, Terminal};
 use std::collections::VecDeque;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -103,6 +106,12 @@ enum TopSort {
     Io,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum InputKind {
+    User,
+    Search,
+}
+
 const HISTORY: usize = 1024;
 
 const C_USER: Color = Color::Green;
@@ -124,6 +133,7 @@ struct View {
     sort: TopSort,
     show_args: bool,
     user_filter: Option<String>,
+    search_filter: Option<String>,
 }
 
 struct App {
@@ -135,8 +145,11 @@ struct App {
     /// Frozen sample while paused.
     paused: Option<Arc<Sample>>,
     user_filter: Option<String>,
-    /// Text being typed for the user filter.
-    input: Option<String>,
+    search_filter: Option<String>,
+    /// Text being typed for the user or search filter.
+    input: Option<(InputKind, String)>,
+    /// Vertical scroll offset (rows).
+    scroll: usize,
     history: VecDeque<CpuUtil>,
     /// Hottest CPU reading since start (or the last reset): (Celsius, unix time).
     temp_peak: Option<(f64, f64)>,
@@ -146,14 +159,26 @@ struct App {
     /// Black and white: no colours, only bold/dim/reverse (also NO_COLOR).
     mono: bool,
     groups: Vec<DiskGroup>,
+    record_dir: PathBuf,
+    record_format: Format,
     last_seq: Option<u64>,
     status: Vec<String>,
     log: LogRing,
 }
 
-pub fn run(hub: Arc<Hub>, show: &str, status: Vec<String>, log: LogRing, groups: Vec<DiskGroup>) -> Result<()> {
+pub fn run(
+    hub: Arc<Hub>,
+    show: &str,
+    status: Vec<String>,
+    log: LogRing,
+    groups: Vec<DiskGroup>,
+    record_dir: PathBuf,
+    record_format: Format,
+) -> Result<()> {
     let mut app = App::new(hub, show, status, log);
     app.groups = groups;
+    app.record_dir = record_dir;
+    app.record_format = record_format;
     // https://no-color.org
     app.mono = std::env::var_os("NO_COLOR").is_some_and(|v| !v.is_empty());
     let mut terminal = ratatui::init();
@@ -204,13 +229,17 @@ impl App {
             busy_only: false,
             paused: None,
             user_filter: None,
+            search_filter: None,
             input: None,
+            scroll: 0,
             history: VecDeque::with_capacity(HISTORY),
             temp_peak: None,
             cpu_peaks: Vec::new(),
             show_partitions: false,
             mono: false,
             groups: Vec::new(),
+            record_dir: PathBuf::from("."),
+            record_format: Format::Nmon,
             last_seq: None,
             status,
             log,
@@ -300,11 +329,15 @@ impl App {
         if mods.contains(KeyModifiers::CONTROL) && code == KeyCode::Char('c') {
             return false;
         }
-        if let Some(buf) = &mut self.input {
+        if let Some((kind, buf)) = &mut self.input {
             match code {
                 KeyCode::Enter => {
                     let v = buf.trim().to_string();
-                    self.user_filter = (!v.is_empty()).then_some(v);
+                    let val = (!v.is_empty()).then_some(v);
+                    match kind {
+                        InputKind::User => self.user_filter = val,
+                        InputKind::Search => self.search_filter = val,
+                    }
                     self.input = None;
                 }
                 KeyCode::Esc => self.input = None,
@@ -318,6 +351,12 @@ impl App {
         }
         match code {
             KeyCode::Char('q') | KeyCode::Esc => return false,
+            KeyCode::Up | KeyCode::Char('[') => self.scroll = self.scroll.saturating_sub(1),
+            KeyCode::Down | KeyCode::Char(']') => self.scroll = self.scroll.saturating_add(1),
+            KeyCode::PageUp => self.scroll = self.scroll.saturating_sub(10),
+            KeyCode::PageDown => self.scroll = self.scroll.saturating_add(10),
+            KeyCode::Home => self.scroll = 0,
+            KeyCode::End => self.scroll = usize::MAX / 2,
             KeyCode::Char('+') => self.hub.set_interval(self.hub.interval() * 2),
             KeyCode::Char('-') => self.hub.set_interval(self.hub.interval() / 2),
             KeyCode::Char('3') => self.sort = TopSort::Cpu,
@@ -329,7 +368,13 @@ impl App {
             KeyCode::Char('0') => self.cpu_peaks.clear(),
             KeyCode::Char('G') => self.show_partitions = !self.show_partitions,
             KeyCode::Char('b') => self.mono = !self.mono,
-            KeyCode::Char('u') => self.input = Some(self.user_filter.clone().unwrap_or_default()),
+            KeyCode::Char('u') => {
+                self.input = Some((InputKind::User, self.user_filter.clone().unwrap_or_default()));
+            }
+            KeyCode::Char('/') => {
+                self.input = Some((InputKind::Search, self.search_filter.clone().unwrap_or_default()));
+            }
+            KeyCode::Char('w') => self.toggle_recording(),
             KeyCode::Char('p') => {
                 self.paused = match self.paused {
                     Some(_) => None,
@@ -351,6 +396,33 @@ impl App {
         true
     }
 
+    fn toggle_recording(&mut self) {
+        if let Some(path) = self.hub.recording_path() {
+            self.hub.set_live_sink(None);
+            tracing::info!("stopped recording {}", path.display());
+            return;
+        }
+        let Some(s) = self.hub.latest() else { return };
+        let settings = RecordSettings {
+            dir: self.record_dir.clone(),
+            format: self.record_format,
+            interval: self.hub.interval().as_secs_f64(),
+            count: None,
+            rotate: true,
+            compress: false,
+            keep_days: None,
+            groups: self.groups.clone(),
+        };
+        match Recorder::new(settings, s.host.clone()) {
+            Ok(rec) => {
+                let path = rec.path().to_path_buf();
+                tracing::info!("recording to {}", path.display());
+                self.hub.set_live_sink(Some((path, Box::new(rec))));
+            }
+            Err(e) => tracing::warn!("starting recording: {e}"),
+        }
+    }
+
     fn view(&self, width: usize) -> View {
         View {
             width,
@@ -359,6 +431,7 @@ impl App {
             sort: self.sort,
             show_args: self.show_args,
             user_filter: self.user_filter.clone(),
+            search_filter: self.search_filter.clone(),
         }
     }
 
@@ -387,7 +460,7 @@ impl App {
             return;
         }
         let v = self.view(body.width.saturating_sub(2) as usize);
-        let contents: Vec<(Panel, Vec<Line<'static>>)> = self
+        let mut contents: Vec<(Panel, Vec<Line<'static>>)> = self
             .panels
             .iter()
             .map(|&p| {
@@ -417,23 +490,76 @@ impl App {
                 (p, lines)
             })
             .collect();
-        let constraints: Vec<Constraint> = contents
+
+        let other_h: usize = contents
             .iter()
-            .map(|(p, lines)| match p {
-                Panel::Top => Constraint::Min(5),
-                _ => Constraint::Length(lines.len() as u16 + 2),
-            })
-            .collect();
-        let areas = Layout::vertical(constraints).split(body);
-        for ((p, lines), area) in contents.into_iter().zip(areas.iter()) {
-            let block = Block::default()
-                .borders(Borders::ALL)
-                .border_style(DIM)
-                .title(Span::styled(
-                    format!(" {} ", p.title()),
-                    Style::default().remove_modifier(Modifier::DIM).add_modifier(Modifier::BOLD),
-                ));
-            f.render_widget(Paragraph::new(lines).block(block), *area);
+            .filter(|(p, _)| *p != Panel::Top)
+            .map(|(_, lines)| lines.len() + 2)
+            .sum();
+        let has_top = contents.iter().any(|(p, _)| *p == Panel::Top);
+        let panels_fit = if has_top {
+            other_h + 7 <= body.height as usize
+        } else {
+            other_h <= body.height as usize
+        };
+
+        if panels_fit {
+            if self.scroll > 0
+                && let Some((_, lines)) = contents.iter_mut().find(|(p, _)| *p == Panel::Top)
+                && lines.len() > 2
+            {
+                let skip = self.scroll.min(lines.len().saturating_sub(2));
+                lines.drain(1..=skip);
+            }
+            let constraints: Vec<Constraint> = contents
+                .iter()
+                .map(|(p, lines)| match p {
+                    Panel::Top => Constraint::Min(5),
+                    _ => Constraint::Length(lines.len() as u16 + 2),
+                })
+                .collect();
+            let areas = Layout::vertical(constraints).split(body);
+            for ((p, lines), area) in contents.into_iter().zip(areas.iter()) {
+                let block = Block::default()
+                    .borders(Borders::ALL)
+                    .border_style(DIM)
+                    .title(Span::styled(
+                        format!(" {} ", p.title()),
+                        Style::default().remove_modifier(Modifier::DIM).add_modifier(Modifier::BOLD),
+                    ));
+                f.render_widget(Paragraph::new(lines).block(block), *area);
+            }
+        } else {
+            let total_h: u16 = contents
+                .iter()
+                .map(|(_, lines)| (lines.len() as u16).saturating_add(2))
+                .fold(0u16, u16::saturating_add)
+                .max(body.height);
+            let vrect = Rect::new(0, 0, body.width, total_h);
+            let mut vbuf = Buffer::empty(vrect);
+            let constraints: Vec<Constraint> = contents
+                .iter()
+                .map(|(_, lines)| Constraint::Length((lines.len() as u16).saturating_add(2)))
+                .collect();
+            let areas = Layout::vertical(constraints).split(vrect);
+            for ((p, lines), area) in contents.into_iter().zip(areas.iter()) {
+                let block = Block::default()
+                    .borders(Borders::ALL)
+                    .border_style(DIM)
+                    .title(Span::styled(
+                        format!(" {} ", p.title()),
+                        Style::default().remove_modifier(Modifier::DIM).add_modifier(Modifier::BOLD),
+                    ));
+                Paragraph::new(lines).block(block).render(*area, &mut vbuf);
+            }
+            let max_scroll = total_h.saturating_sub(body.height) as usize;
+            let offset = self.scroll.min(max_scroll) as u16;
+            let dst = f.buffer_mut();
+            for y in 0..body.height {
+                for x in 0..body.width {
+                    dst[(body.x + x, body.y + y)] = vbuf[(x, offset + y)].clone();
+                }
+            }
         }
     }
 
@@ -458,6 +584,10 @@ impl App {
                 spans.push(Span::styled(" DEMO DATA ", badge(Color::Red, Color::White)));
             }
         }
+        if let Some(path) = self.hub.recording_path() {
+            let name = path.file_name().map(|f| f.to_string_lossy().into_owned()).unwrap_or_else(|| path.display().to_string());
+            spans.push(Span::styled(format!(" REC {name} "), badge(Color::Green, Color::White)));
+        }
         if self.paused.is_some() {
             spans.push(Span::styled(" PAUSED ", badge(Color::Yellow, Color::Black)));
         }
@@ -470,14 +600,24 @@ impl App {
         if let Some(u) = &self.user_filter {
             spans.push(Span::raw(format!(" │ user={u}")));
         }
+        if let Some(q) = &self.search_filter {
+            spans.push(Span::raw(format!(" │ filter={q}")));
+        }
+        if self.scroll > 0 {
+            spans.push(Span::raw(format!(" │ +{} lines", self.scroll)));
+        }
         Paragraph::new(Line::from(spans)).style(Style::default().add_modifier(Modifier::REVERSED))
     }
 
     fn footer(&self) -> Paragraph<'static> {
-        if let Some(buf) = &self.input {
+        if let Some((kind, buf)) = &self.input {
+            let prompt = match kind {
+                InputKind::User => " Show processes of user: ",
+                InputKind::Search => " Filter processes (command/args/jail): ",
+            };
             return Paragraph::new(Line::from(vec![
-                Span::styled(" Show processes of user: ", Style::default().add_modifier(Modifier::REVERSED)),
-                Span::raw(format!(" {buf}_   (Enter = apply, empty = all users, Esc = cancel)")),
+                Span::styled(prompt, Style::default().add_modifier(Modifier::REVERSED)),
+                Span::raw(format!(" {buf}_   (Enter = apply, empty = clear, Esc = cancel)")),
             ]));
         }
         let dim = DIM;
@@ -672,17 +812,20 @@ const HELP_TOP: &[(&str, &str)] = &[
     ("5", "Sort by I/O"),
     ("a", "Full command lines"),
     ("u", "Filter by user"),
+    ("/", "Search command/jail"),
 ];
 
 const HELP_MODES: &[(&str, &str)] = &[
     (".", "Busy only (hide idle)"),
     ("G", "Include partitions/GEOM"),
     ("p", "Pause / resume"),
+    ("w", "Start / stop recording"),
     ("+", "Double interval"),
     ("-", "Halve interval"),
     ("b", "Black & white"),
     ("0", "Reset CPU peaks (>)"),
     ("R", "Reset temperature peak"),
+    ("[]", "Scroll panels / top"),
     ("^L", "Redraw screen"),
     ("q", "Quit"),
 ];
@@ -1143,6 +1286,12 @@ fn tcp(s: &Sample) -> Vec<Line<'static>> {
         "Since boot: {} retransmits, {} listen-queue overflows, {} bad checksums, {} dropped connections",
         t.retransmits, t.listen_drops, t.bad_checksums, t.drops
     )));
+    if let Some(u) = s.rates.as_ref().and_then(|r| r.udp) {
+        lines.push(Line::raw(format!(
+            "UDP datagrams/s  in {:>10.0}   out {:>10.0}   errors/s {:.1}   no-port/s {:.1}   full-buf/s {:.1}",
+            u.datagrams_in, u.datagrams_out, u.in_errors, u.no_ports, u.full_socket_buffers
+        )));
+    }
     lines
 }
 
@@ -1201,8 +1350,16 @@ fn top(s: &Sample, v: &View) -> Vec<Line<'static>> {
         TopSort::Mem => "memory",
         TopSort::Io => "I/O",
     };
+    let mut filters = String::new();
+    if let Some(u) = &v.user_filter {
+        filters.push_str(&format!(", user {u}"));
+    }
+    if let Some(q) = &v.search_filter {
+        filters.push_str(&format!(", filter {q}"));
+    }
+    let search_lower = v.search_filter.as_ref().map(|q| q.to_lowercase());
     let mut lines = vec![hdr(format!(
-        "{:>7} {:>6} {:>8} {:>8} {:>7} {:>7} {:>6} {:>4} {:<9} {:<10} {:<8} Command   (by {sort}{})",
+        "{:>7} {:>6} {:>8} {:>8} {:>7} {:>7} {:>6} {:>4} {:<9} {:<10} {:<8} Command   (by {sort}{filters})",
         "PID",
         "%CPU",
         "RES",
@@ -1214,12 +1371,22 @@ fn top(s: &Sample, v: &View) -> Vec<Line<'static>> {
         "State",
         "User",
         "Jail",
-        v.user_filter.as_ref().map(|u| format!(", user {u}")).unwrap_or_default()
     ))];
     for i in order {
         let p = &snap.processes[i];
         if v.user_filter.as_ref().is_some_and(|u| &p.user != u) {
             continue;
+        }
+        let jname = jail_name(p.jid);
+        if let Some(q) = &search_lower {
+            let matches = p.command.to_lowercase().contains(q)
+                || p.args.to_lowercase().contains(q)
+                || p.user.to_lowercase().contains(q)
+                || jname.to_lowercase().contains(q)
+                || p.pid.to_string().contains(q);
+            if !matches {
+                continue;
+            }
         }
         let cpu = r.proc_cpu[i];
         let io = r.proc_io[i];
@@ -1246,7 +1413,7 @@ fn top(s: &Sample, v: &View) -> Vec<Line<'static>> {
                 p.threads,
                 p.state,
                 p.user,
-                jail_name(p.jid),
+                jname,
                 if v.show_args { &p.args } else { &p.command }
             ),
             style,
@@ -1731,6 +1898,21 @@ mod tests {
         }
         app.key(KeyCode::Enter, KeyModifiers::NONE);
         assert_eq!(app.user_filter, None);
+
+        app.key(KeyCode::Char('/'), KeyModifiers::NONE);
+        for c in "postgres".chars() {
+            app.key(KeyCode::Char(c), KeyModifiers::NONE);
+        }
+        assert_eq!(app.panels, vec![Panel::Top]);
+        app.key(KeyCode::Enter, KeyModifiers::NONE);
+        assert_eq!(app.search_filter.as_deref(), Some("postgres"));
+
+        app.key(KeyCode::Down, KeyModifiers::NONE);
+        assert_eq!(app.scroll, 1);
+        app.key(KeyCode::PageDown, KeyModifiers::NONE);
+        assert_eq!(app.scroll, 11);
+        app.key(KeyCode::Home, KeyModifiers::NONE);
+        assert_eq!(app.scroll, 0);
     }
 }
 
@@ -1847,6 +2029,7 @@ mod alignment_tests {
             sort: TopSort::Cpu,
             show_args: false,
             user_filter: None,
+            search_filter: None,
         };
         let lines: Vec<String> = nets(&s, &v).iter().map(text).collect();
         for l in &lines {

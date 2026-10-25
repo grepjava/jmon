@@ -65,10 +65,13 @@ In the process list:
 - `3`, `4` and `5` sort by CPU, memory or I/O.
 - `a` shows full command lines.
 - `u` filters by user.
+- `/` searches by command, arguments, user or jail.
 
 Anywhere:
 - `.` hides idle CPUs, disks, interfaces and processes.
 - `p` pauses.
+- `w` starts or stops an `.nmon` recording.
+- `Up`, `Down`, `PgUp`, `PgDn`, `Home` and `End` scroll overflowing panels or the process list.
 - `G` adds partitions and other GEOM providers to the disk views.
 - `0` resets the CPU peak markers.
 - `b` switches to black and white (also when `NO_COLOR` is set).
@@ -117,6 +120,7 @@ The service runs as `nobody` under daemon(8), which restarts it if it exits. Log
 | `system.network.io`, `.packets`, `.errors`, `.dropped` | | `network.interface.name`, `network.io.direction` |
 | `system.network.connections` | | `network.transport`, `network.connection.state` |
 | `freebsd.tcp.{segments,retransmitted_segments,listen_queue_overflows,accepts,connect_attempts}` | | |
+| `freebsd.udp.{datagrams,errors,dropped}` | | `network.io.direction`, `freebsd.udp.drop_reason` |
 | `system.filesystem.usage`, `.utilization` | By, 1 | `system.device`, `system.filesystem.{mountpoint,type,state}` |
 | `system.process.count`, `system.process.created`, `system.uptime` | | `process.state` |
 | `freebsd.threads.count` | | `freebsd.thread.state` (runnable, disk_wait, page_wait, sleeping) |
@@ -127,11 +131,11 @@ The service runs as `nobody` under daemon(8), which restarts it if it exits. Log
 | `freebsd.kernel.{context_switches,interrupts,syscalls,traps}`, `freebsd.vm.page_faults` | | |
 | `hw.temperature` | Cel | `hw.id`, `hw.type` (cpu, thermal_zone) |
 | `hw.battery.charge`, `hw.battery.time_left` | 1, s | `hw.id`, `hw.battery.state` |
-| `freebsd.jail.{cpu.utilization,memory.usage,process.count}` | | `freebsd.jail.id`, `freebsd.jail.name` |
+| `freebsd.jail.{cpu.utilization,memory.usage,process.count,io.operations}` | | `freebsd.jail.id`, `freebsd.jail.name` |
 | `freebsd.bhyve.{cpu.utilization,memory.usage}` | | `freebsd.bhyve.vm.name` |
 | `freebsd.zfs.arc.{size,target_size,hits,misses,hit_ratio}`, `freebsd.zfs.l2arc.size` | | |
 | `freebsd.zfs.pool.{usage,fragmentation,health,io,operations}` | | `zfs.pool.name`, `zfs.pool.state` / `.health`, `disk.io.direction` |
-| `process.{cpu.utilization,memory.usage,memory.virtual,disk.operations,paging.faults}` | | `process.pid`, `process.executable.name`, `process.owner`. Only emitted with `--export-top N` |
+| `process.{cpu.time,cpu.utilization,memory.usage,memory.virtual,disk.operations,paging.faults}` | | `process.pid`, `process.executable.name`, `process.owner`. Only emitted with `--export-top N` |
 | `jmon.collection.duration`, `jmon.otlp.exports`, `jmon.prometheus.scrapes` | | `result` |
 
 In Prometheus output, dots become underscores and the usual suffixes are added (for example `system_cpu_time_seconds_total`).

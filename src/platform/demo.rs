@@ -21,6 +21,7 @@ pub struct Collector {
     nets: Vec<NetIf>,
     procs: Vec<Process>,
     tcp: Tcp,
+    udp: Udp,
     zfs: Zfs,
     superpages: Superpages,
     nfs: Nfs,
@@ -74,6 +75,7 @@ impl Collector {
             command: cmd.into(),
             state: "sleeping",
             threads: 1,
+            start_time: 1_700_000_000_000_000 + pid as i64,
             ..Default::default()
         })
         .collect();
@@ -89,6 +91,7 @@ impl Collector {
             nets: vec![net("em0", 1500), net("lo0", 16384)],
             procs,
             tcp: Tcp::default(),
+            udp: Udp::default(),
             superpages: Superpages { enabled: true, ..Default::default() },
             nfs: Nfs {
                 client_ops: ["getattr", "lookup", "read", "write", "access", "readdir"]
@@ -205,7 +208,10 @@ impl Collector {
             let n = self.noise();
             let weight = [0.001, 0.02, 0.001, 0.005, 0.1, 0.08, 0.3, 0.25, 0.9, 0.05, 0.04, 0.6][i];
             let p = &mut self.procs[i];
-            p.cpu_time_us += (dt * 1e6 * weight * (0.5 + n)) as u64;
+            let delta_us = (dt * 1e6 * weight * (0.5 + n)) as u64;
+            p.cpu_time_us += delta_us;
+            p.user_time_us += (delta_us as f64 * 0.75) as u64;
+            p.sys_time_us += delta_us - (delta_us as f64 * 0.75) as u64;
             p.read_ops += (dt * 200.0 * weight * n) as u64;
             p.write_ops += (dt * 120.0 * weight * (1.0 - n)) as u64;
             p.minor_faults += (dt * 900.0 * weight * n) as u64;
@@ -224,6 +230,11 @@ impl Collector {
         tcp.retransmits += rate(12.0, n);
         tcp.listen_drops += if n > 0.95 { 1 } else { 0 };
         tcp.states = vec![("listen", 12), ("established", 140 + (n * 20.0) as u64), ("time_wait", 35), ("close_wait", 2)];
+
+        let udp = &mut self.udp;
+        udp.datagrams_in += rate(800.0, n);
+        udp.datagrams_out += rate(750.0, n);
+        udp.no_ports += if n > 0.8 { 1 } else { 0 };
 
         let z = &mut self.zfs;
         z.arc_hits += rate(20_000.0, n);
@@ -309,6 +320,7 @@ impl Collector {
                 battery: Some(Battery { life: 87.0, minutes_left: Some(212), state: "discharging", ac_online: false }),
             },
             tcp: Some(self.tcp.clone()),
+            udp: Some(self.udp),
             jails: vec![
                 Jail { jid: 1, name: "www".into(), hostname: "www.example.org".into() },
                 Jail { jid: 2, name: "db".into(), hostname: "db.example.org".into() },

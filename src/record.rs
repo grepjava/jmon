@@ -51,6 +51,7 @@ pub struct RecordSettings {
     pub interval: f64,
     pub count: Option<u64>,
     pub rotate: bool,
+    pub compress: bool,
     pub keep_days: Option<u64>,
     pub groups: Vec<DiskGroup>,
 }
@@ -99,11 +100,13 @@ impl Recorder {
         let (Some(days), true) = (self.cfg.keep_days, self.cfg.rotate) else { return };
         let prefix = format!("{}_", short_host(&self.host));
         let suffix = format!(".{}", self.cfg.format.ext());
+        let gz_suffix = format!("{suffix}.gz");
         let cutoff = SystemTime::now() - Duration::from_secs(days * 86_400);
         let Ok(entries) = std::fs::read_dir(&self.cfg.dir) else { return };
         for e in entries.flatten() {
             let name = e.file_name().to_string_lossy().into_owned();
-            if !name.starts_with(&prefix) || !name.ends_with(&suffix) || e.path() == self.path {
+            let matches_ext = name.ends_with(&suffix) || name.ends_with(&gz_suffix);
+            if !name.starts_with(&prefix) || !matches_ext || e.path() == self.path {
                 continue;
             }
             if e.metadata().and_then(|m| m.modified()).is_ok_and(|t| t < cutoff) {
@@ -116,6 +119,16 @@ impl Recorder {
     }
 }
 
+fn compress_file(path: PathBuf) {
+    let _ = std::thread::Builder::new().name("jmon-gzip".into()).spawn(move || {
+        match std::process::Command::new("gzip").arg("-f").arg(&path).status() {
+            Ok(s) if s.success() => info!("compressed rotated recording {}.gz", path.display()),
+            Ok(s) => warn!("gzip {}: exited with {s}", path.display()),
+            Err(e) => warn!("gzip {}: {e}", path.display()),
+        }
+    });
+}
+
 impl Sink for Recorder {
     fn write(&mut self, s: &Sample) -> io::Result<()> {
         let today = Local::now().date_naive();
@@ -123,8 +136,12 @@ impl Sink for Recorder {
             let (path, inner) = Self::open_new(&self.cfg, &self.host)?;
             info!("rotated recording to {}", path.display());
             self.day = today;
-            self.path = path;
-            self.inner = inner;
+            let old_path = std::mem::replace(&mut self.path, path);
+            let old_inner = std::mem::replace(&mut self.inner, inner);
+            drop(old_inner);
+            if self.cfg.compress {
+                compress_file(old_path);
+            }
             self.prune();
         }
         self.inner.write(s)
@@ -163,8 +180,8 @@ pub struct Nmon<W: Write> {
     groups: Vec<DiskGroup>,
     nfs_client_ops: Vec<String>,
     nfs_server_ops: Vec<String>,
-    /// PIDs already described in a UARG line.
-    uarg_seen: HashSet<i32>,
+    /// (PID, start_time) pairs already described in a UARG line.
+    uarg_seen: HashSet<(i32, i64)>,
     hooks: Hooks,
     started: bool,
 }
@@ -486,6 +503,14 @@ impl<W: Write + Send> Sink for Nmon<W> {
             writeln!(o, "DGXFER,{tag},{}", col(&|d| d.read_iops + d.write_iops))?;
         }
         if let Some(n) = &r.nfs {
+            if self.nfs_client_ops.is_empty() && !n.client_ops.is_empty() {
+                self.nfs_client_ops = n.client_ops.iter().map(|o| o.0.clone()).collect();
+                writeln!(o, "NFSCLIV3,NFS Client v3 {},{}", s.host.hostname, self.nfs_client_ops.join(","))?;
+            }
+            if self.nfs_server_ops.is_empty() && !n.server_ops.is_empty() {
+                self.nfs_server_ops = n.server_ops.iter().map(|o| o.0.clone()).collect();
+                writeln!(o, "NFSSVRV3,NFS Server v3 {},{}", s.host.hostname, self.nfs_server_ops.join(","))?;
+            }
             let col = |names: &[String], ops: &[(String, f64)]| {
                 names
                     .iter()
@@ -539,10 +564,12 @@ impl<W: Write + Send> Sink for Nmon<W> {
             if cpu < 0.1 {
                 break;
             }
+            let usr = r.proc_user_cpu.get(i).copied().unwrap_or(cpu);
+            let sys = r.proc_sys_cpu.get(i).copied().unwrap_or(0.0);
             let p = &snap.processes[i];
             writeln!(
                 o,
-                "TOP,{:07},{tag},{cpu:.2},{cpu:.2},0.00,{},{},0,0,0,{:.1},{:.1},{}",
+                "TOP,{:07},{tag},{cpu:.2},{usr:.2},{sys:.2},{},{},0,0,0,{:.1},{:.1},{}",
                 p.pid,
                 p.vsize / 1024,
                 p.rss / 1024,
@@ -550,8 +577,8 @@ impl<W: Write + Send> Sink for Nmon<W> {
                 r.proc_faults[i].1,
                 p.command.replace(',', "_")
             )?;
-            // nmon writes each process's full command line once.
-            if self.uarg_seen.insert(p.pid) {
+            // nmon writes each process's full command line once; key by (pid, start_time) for PID reuse.
+            if self.uarg_seen.insert((p.pid, p.start_time)) {
                 writeln!(
                     o,
                     "UARG,{tag},{:07},{},{},{},{},-,{}",
@@ -568,5 +595,71 @@ impl<W: Write + Send> Sink for Nmon<W> {
             o.write_all(&run_hook(cmd, &tag))?;
         }
         o.flush()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::model::{Process, Snapshot};
+    use std::time::Duration;
+
+    #[test]
+    fn nmon_splits_user_sys_cpu_and_emits_uarg_on_pid_reuse() {
+        let host = Arc::new(HostInfo {
+            hostname: "box".into(),
+            os_type: "freebsd".into(),
+            os_release: "14.3".into(),
+            machine: "amd64".into(),
+            cpu_model: "cpu".into(),
+            ncpu: 1,
+            physmem: 1 << 30,
+            pagesize: 4096,
+            demo: true,
+        });
+        let mut s0 = Snapshot::empty();
+        s0.processes.push(Process {
+            pid: 42,
+            ppid: 1,
+            start_time: 100,
+            command: "worker".into(),
+            args: "worker --first".into(),
+            user: "root".into(),
+            threads: 1,
+            ..Default::default()
+        });
+        let mut s1 = s0.clone();
+        s1.taken = s0.taken + Duration::from_secs(1);
+        s1.processes[0].cpu_time_us = 500_000;
+        s1.processes[0].user_time_us = 300_000;
+        s1.processes[0].sys_time_us = 200_000;
+
+        let mut buf: Vec<u8> = Vec::new();
+        {
+            let mut nmon = Nmon::new(&mut buf, 1.0, None, vec![]);
+            let sample1 = Sample::derive(1, host.clone(), Some(&s0), s1.clone());
+            nmon.write(&sample1).unwrap();
+
+            // PID 42 is recycled for a new process (start_time = 200) and then runs for 1s.
+            let mut s2 = s1.clone();
+            s2.taken = s1.taken + Duration::from_secs(1);
+            s2.processes[0].start_time = 200;
+            s2.processes[0].args = "worker --second".into();
+            s2.processes[0].cpu_time_us = 0;
+            s2.processes[0].user_time_us = 0;
+            s2.processes[0].sys_time_us = 0;
+
+            let mut s3 = s2.clone();
+            s3.taken = s2.taken + Duration::from_secs(1);
+            s3.processes[0].cpu_time_us = 200_000;
+            s3.processes[0].user_time_us = 150_000;
+            s3.processes[0].sys_time_us = 50_000;
+            let sample3 = Sample::derive(2, host, Some(&s2), s3);
+            nmon.write(&sample3).unwrap();
+        }
+        let text = String::from_utf8(buf).unwrap();
+        assert!(text.contains("TOP,0000042,T0001,50.00,30.00,20.00,"), "{text}");
+        assert!(text.contains("UARG,T0001,0000042,1,worker,1,root,-,worker --first"), "{text}");
+        assert!(text.contains("UARG,T0002,0000042,1,worker,1,root,-,worker --second"), "{text}");
     }
 }

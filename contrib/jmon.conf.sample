@@ -20,6 +20,7 @@ prometheus = "127.0.0.1:9464"
 #auto-record = true
 #record-dir = "/var/log/jmon"
 #rotate = true
+#record-compress = true
 #record-keep = 30
 
 # Disk groups, shown with the `g` key and recorded as nmon DG* sections.

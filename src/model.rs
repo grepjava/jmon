@@ -193,8 +193,14 @@ pub struct Process {
     pub jid: i32,
     pub state: &'static str,
     pub threads: u32,
+    /// Process start time in microseconds since the Unix epoch (disambiguates recycled PIDs).
+    pub start_time: i64,
     /// Cumulative CPU time in microseconds.
     pub cpu_time_us: u64,
+    /// Cumulative user CPU time in microseconds (rusage).
+    pub user_time_us: u64,
+    /// Cumulative system CPU time in microseconds (rusage).
+    pub sys_time_us: u64,
     pub rss: u64,
     pub vsize: u64,
     /// Cumulative block input and output operations (rusage).
@@ -228,6 +234,7 @@ pub struct Snapshot {
     pub processes: Vec<Process>,
     pub sensors: Sensors,
     pub tcp: Option<Tcp>,
+    pub udp: Option<Udp>,
     pub jails: Vec<Jail>,
     pub zfs: Option<Zfs>,
     /// Present only while NFS is in use (an NFS mount or a running nfsd).
@@ -271,6 +278,16 @@ pub struct Tcp {
     pub listen_drops: u64,
     pub bad_checksums: u64,
     pub states: Vec<(&'static str, u64)>,
+}
+
+/// Cumulative UDP counters from net.inet.udp.stats.
+#[derive(Debug, Clone, Copy, Default, Serialize)]
+pub struct Udp {
+    pub datagrams_in: u64,
+    pub datagrams_out: u64,
+    pub in_errors: u64,
+    pub no_ports: u64,
+    pub full_socket_buffers: u64,
 }
 
 #[derive(Debug, Clone, Default, Serialize)]
@@ -331,6 +348,7 @@ impl Snapshot {
             processes: vec![],
             sensors: Default::default(),
             tcp: None,
+            udp: None,
             jails: vec![],
             zfs: None,
             nfs: None,

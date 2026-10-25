@@ -69,13 +69,101 @@ fn sysctl_mib_raw(mib: &[libc::c_int]) -> io::Result<Vec<u8>> {
     Err(io::Error::from_raw_os_error(libc::ENOMEM))
 }
 
-/// Reads an integer sysctl that may be `int`, `u_int`, `long` or `uint64_t`.
+/// Reads an integer sysctl that may be `int`, `u_int`, `long` or `uint64_t`
+/// in a single syscall using a stack buffer.
 fn sysctl_uint(name: &str) -> io::Result<u64> {
-    let buf = sysctl_raw(name)?;
-    match buf.len() {
+    let cname = CString::new(name).map_err(|_| io::ErrorKind::InvalidInput)?;
+    let mut buf = [0u8; 8];
+    let mut len: libc::size_t = buf.len();
+    let rc = unsafe {
+        libc::sysctlbyname(cname.as_ptr(), buf.as_mut_ptr().cast(), &mut len, std::ptr::null(), 0)
+    };
+    if rc != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    match len {
         4 => Ok(u32::from_ne_bytes(buf[..4].try_into().unwrap()) as u64),
-        8 => Ok(u64::from_ne_bytes(buf[..8].try_into().unwrap())),
+        8 => Ok(u64::from_ne_bytes(buf)),
         n => Err(io::Error::new(io::ErrorKind::InvalidData, format!("{name}: unexpected size {n}"))),
+    }
+}
+
+fn sysctl_mib_uint(mib: &[libc::c_int]) -> io::Result<u64> {
+    if mib.is_empty() {
+        return Err(io::Error::from_raw_os_error(libc::ENOENT));
+    }
+    let mut buf = [0u8; 8];
+    let mut len: libc::size_t = buf.len();
+    let rc = unsafe {
+        libc::sysctl(mib.as_ptr(), mib.len() as u32, buf.as_mut_ptr().cast(), &mut len, std::ptr::null(), 0)
+    };
+    if rc != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    match len {
+        4 => Ok(u32::from_ne_bytes(buf[..4].try_into().unwrap()) as u64),
+        8 => Ok(u64::from_ne_bytes(buf)),
+        n => Err(io::Error::new(io::ErrorKind::InvalidData, format!("mib: unexpected size {n}"))),
+    }
+}
+
+fn sysctl_mib_int(mib: &[libc::c_int]) -> Option<i64> {
+    if mib.is_empty() {
+        return None;
+    }
+    let mut buf = [0u8; 8];
+    let mut len: libc::size_t = buf.len();
+    let rc = unsafe {
+        libc::sysctl(mib.as_ptr(), mib.len() as u32, buf.as_mut_ptr().cast(), &mut len, std::ptr::null(), 0)
+    };
+    if rc != 0 {
+        return None;
+    }
+    match len {
+        4 => Some(i32::from_ne_bytes(buf[..4].try_into().unwrap()) as i64),
+        8 => Some(i64::from_ne_bytes(buf)),
+        _ => None,
+    }
+}
+
+/// Pre-resolved sysctl OID so hot-path reads skip ASCII name resolution in the kernel.
+#[derive(Clone, Default)]
+struct Mib(Vec<libc::c_int>);
+
+impl Mib {
+    fn lookup(name: &str) -> Self {
+        let Ok(cname) = CString::new(name) else { return Mib::default() };
+        let mut mib = [0 as libc::c_int; libc::CTL_MAXNAME as usize];
+        let mut len: libc::size_t = mib.len();
+        if unsafe { libc::sysctlnametomib(cname.as_ptr(), mib.as_mut_ptr(), &mut len) } == 0 {
+            Mib(mib[..len].to_vec())
+        } else {
+            Mib::default()
+        }
+    }
+
+    fn uint(&self) -> io::Result<u64> {
+        sysctl_mib_uint(&self.0)
+    }
+
+    fn uint_or_zero(&self) -> u64 {
+        self.uint().unwrap_or(0)
+    }
+
+    fn int(&self) -> Option<i64> {
+        sysctl_mib_int(&self.0)
+    }
+
+    fn celsius(&self) -> Option<f64> {
+        let v = self.uint().ok()? as u32 as i32;
+        (v > 0).then(|| (v - 2731) as f64 / 10.0)
+    }
+
+    fn raw(&self) -> io::Result<Vec<u8>> {
+        if self.0.is_empty() {
+            return Err(io::Error::from_raw_os_error(libc::ENOENT));
+        }
+        sysctl_mib_raw(&self.0)
     }
 }
 
@@ -162,16 +250,138 @@ fn bintime_secs(bt: &libc::bintime) -> f64 {
 pub struct Collector {
     host: Arc<HostInfo>,
     stathz: u32,
+    mibs: Mibs,
     users: HashMap<u32, String>,
     /// Command lines keyed by pid, tagged with the process start time so a
     /// recycled pid is re-read.
     args: HashMap<i32, (i64, String)>,
     /// `zpool list` is a fork+exec, so pool capacity is refreshed slowly.
     zpools: Option<ZpoolCache>,
+    /// Cached `vfs.nfs.nfsstats` bytes + parsed Nfs so idle NFS mounts do not spawn `nfsstat`.
+    nfs_cache: Option<(Vec<u8>, Nfs)>,
     /// Battery sysctls run ACPI methods (~4 ms each), so read them rarely.
     battery: Option<(Instant, Option<Battery>)>,
     geom: Option<GeomStats>,
     warned: std::collections::HashSet<&'static str>,
+}
+
+struct Mibs {
+    cp_times: Mib,
+    devstat_all: Mib,
+    vmtotal: Mib,
+    tcp_stats: Mib,
+    tcp_states: Mib,
+    udp_stats: Mib,
+    nfs_stats: Mib,
+    // Memory pages
+    v_page_count: Mib,
+    v_active_count: Mib,
+    v_inactive_count: Mib,
+    v_laundry_count: Mib,
+    v_wire_count: Mib,
+    v_free_count: Mib,
+    // VM & kernel counters
+    v_swtch: Mib,
+    v_intr: Mib,
+    v_syscall: Mib,
+    v_trap: Mib,
+    v_forks: Mib,
+    v_vforks: Mib,
+    v_rforks: Mib,
+    v_vm_faults: Mib,
+    v_swappgsin: Mib,
+    v_swappgsout: Mib,
+    v_swapin: Mib,
+    v_swapout: Mib,
+    v_vnodein: Mib,
+    v_vnodeout: Mib,
+    v_vnodepgsin: Mib,
+    v_vnodepgsout: Mib,
+    v_zfod: Mib,
+    v_cow_faults: Mib,
+    v_intrans: Mib,
+    v_reactivated: Mib,
+    v_tfree: Mib,
+    v_pdwakeups: Mib,
+    v_pdpages: Mib,
+    // Superpages
+    pg_ps_enabled: Mib,
+    pde_mappings: Mib,
+    pde_promotions: Mib,
+    pde_demotions: Mib,
+    pde_failures: Mib,
+    // ZFS ARC
+    arc_size: Mib,
+    arc_c: Mib,
+    arc_c_max: Mib,
+    arc_hits: Mib,
+    arc_misses: Mib,
+    arc_l2_size: Mib,
+    arc_l2_hits: Mib,
+    arc_l2_misses: Mib,
+    // Per-CPU sensors
+    cpu_temps: Vec<Mib>,
+    cpu_freqs: Vec<Mib>,
+    cpu_tjmax: Mib,
+}
+
+impl Mibs {
+    fn new(ncpu: usize) -> Self {
+        Mibs {
+            cp_times: Mib::lookup("kern.cp_times"),
+            devstat_all: Mib::lookup("kern.devstat.all"),
+            vmtotal: Mib::lookup("vm.vmtotal"),
+            tcp_stats: Mib::lookup("net.inet.tcp.stats"),
+            tcp_states: Mib::lookup("net.inet.tcp.states"),
+            udp_stats: Mib::lookup("net.inet.udp.stats"),
+            nfs_stats: Mib::lookup("vfs.nfs.nfsstats"),
+            v_page_count: Mib::lookup("vm.stats.vm.v_page_count"),
+            v_active_count: Mib::lookup("vm.stats.vm.v_active_count"),
+            v_inactive_count: Mib::lookup("vm.stats.vm.v_inactive_count"),
+            v_laundry_count: Mib::lookup("vm.stats.vm.v_laundry_count"),
+            v_wire_count: Mib::lookup("vm.stats.vm.v_wire_count"),
+            v_free_count: Mib::lookup("vm.stats.vm.v_free_count"),
+            v_swtch: Mib::lookup("vm.stats.sys.v_swtch"),
+            v_intr: Mib::lookup("vm.stats.sys.v_intr"),
+            v_syscall: Mib::lookup("vm.stats.sys.v_syscall"),
+            v_trap: Mib::lookup("vm.stats.sys.v_trap"),
+            v_forks: Mib::lookup("vm.stats.vm.v_forks"),
+            v_vforks: Mib::lookup("vm.stats.vm.v_vforks"),
+            v_rforks: Mib::lookup("vm.stats.vm.v_rforks"),
+            v_vm_faults: Mib::lookup("vm.stats.vm.v_vm_faults"),
+            v_swappgsin: Mib::lookup("vm.stats.vm.v_swappgsin"),
+            v_swappgsout: Mib::lookup("vm.stats.vm.v_swappgsout"),
+            v_swapin: Mib::lookup("vm.stats.vm.v_swapin"),
+            v_swapout: Mib::lookup("vm.stats.vm.v_swapout"),
+            v_vnodein: Mib::lookup("vm.stats.vm.v_vnodein"),
+            v_vnodeout: Mib::lookup("vm.stats.vm.v_vnodeout"),
+            v_vnodepgsin: Mib::lookup("vm.stats.vm.v_vnodepgsin"),
+            v_vnodepgsout: Mib::lookup("vm.stats.vm.v_vnodepgsout"),
+            v_zfod: Mib::lookup("vm.stats.vm.v_zfod"),
+            v_cow_faults: Mib::lookup("vm.stats.vm.v_cow_faults"),
+            v_intrans: Mib::lookup("vm.stats.vm.v_intrans"),
+            v_reactivated: Mib::lookup("vm.stats.vm.v_reactivated"),
+            v_tfree: Mib::lookup("vm.stats.vm.v_tfree"),
+            v_pdwakeups: Mib::lookup("vm.stats.vm.v_pdwakeups"),
+            v_pdpages: Mib::lookup("vm.stats.vm.v_pdpages"),
+            pg_ps_enabled: Mib::lookup("vm.pmap.pg_ps_enabled"),
+            pde_mappings: Mib::lookup("vm.pmap.pde.mappings"),
+            pde_promotions: Mib::lookup("vm.pmap.pde.promotions"),
+            pde_demotions: Mib::lookup("vm.pmap.pde.demotions"),
+            pde_failures: Mib::lookup("vm.pmap.pde.p_failures"),
+            arc_size: Mib::lookup("kstat.zfs.misc.arcstats.size"),
+            arc_c: Mib::lookup("kstat.zfs.misc.arcstats.c"),
+            arc_c_max: Mib::lookup("kstat.zfs.misc.arcstats.c_max"),
+            arc_hits: Mib::lookup("kstat.zfs.misc.arcstats.hits"),
+            arc_misses: Mib::lookup("kstat.zfs.misc.arcstats.misses"),
+            arc_l2_size: Mib::lookup("kstat.zfs.misc.arcstats.l2_size"),
+            arc_l2_hits: Mib::lookup("kstat.zfs.misc.arcstats.l2_hits"),
+            arc_l2_misses: Mib::lookup("kstat.zfs.misc.arcstats.l2_misses"),
+            cpu_temps: (0..ncpu).map(|i| Mib::lookup(&format!("dev.cpu.{i}.temperature"))).collect(),
+            cpu_freqs: (0..ncpu).map(|i| Mib::lookup(&format!("dev.cpu.{i}.freq"))).collect(),
+            cpu_tjmax: Mib::lookup("dev.cpu.0.coretemp.tjmax"),
+        }
+    }
 }
 
 /// Pool capacity refresh: every 30s, or every 5s while the pools are being written.
@@ -206,12 +416,15 @@ impl Collector {
             pagesize: sysctl_uint("hw.pagesize").context("hw.pagesize")?,
             demo: false,
         };
+        let mibs = Mibs::new(host.ncpu);
         Ok(Collector {
             host: Arc::new(host),
             stathz: if clock.stathz > 0 { clock.stathz as u32 } else { clock.hz as u32 },
+            mibs,
             users: HashMap::new(),
             args: HashMap::new(),
             zpools: None,
+            nfs_cache: None,
             battery: None,
             geom: None,
             warned: Default::default(),
@@ -224,11 +437,11 @@ impl Collector {
 
     pub fn collect(&mut self) -> Snapshot {
         let taken = Instant::now();
-        let cpus = self.ok("cpu", cpu_ticks()).unwrap_or_default();
-        let memory = self.ok("memory", memory(&self.host)).unwrap_or_default();
+        let cpus = self.ok("cpu", cpu_ticks(&self.mibs)).unwrap_or_default();
+        let memory = self.ok("memory", memory(&self.host, &self.mibs)).unwrap_or_default();
         let swap = self.ok("swap", swap(self.host.pagesize)).unwrap_or_default();
-        let vm = vm_counters();
-        let disks = self.ok("disks", disks()).unwrap_or_default();
+        let vm = vm_counters(&self.mibs);
+        let disks = self.ok("disks", disks(&self.mibs)).unwrap_or_default();
         let nets = self.ok("network", nets()).unwrap_or_default();
         let filesystems = self.ok("filesystems", filesystems()).unwrap_or_default();
         let processes = match processes(self.host.pagesize) {
@@ -249,7 +462,11 @@ impl Collector {
         let partitions = self.partitions(&disks);
         let nfs_active = filesystems.iter().any(|f| f.fstype.starts_with("nfs"))
             || processes.iter().any(|p| p.command == "nfsd");
-        let nfs = if nfs_active { self.ok("nfs", nfs()) } else { None };
+        let nfs = if nfs_active { self.collect_nfs() } else { None };
+        let runq = self.mibs.vmtotal.raw().ok().and_then(|b| parse_vmtotal(&b)).unwrap_or_default();
+        let superpages = superpages(&self.mibs);
+        let tcp_snap = self.ok("tcp", tcp(&self.mibs)).flatten();
+        let udp_snap = udp(&self.mibs);
         Snapshot {
             taken,
             timestamp: unix_now(),
@@ -260,19 +477,34 @@ impl Collector {
             memory,
             swap,
             vm,
-            runq: sysctl_raw("vm.vmtotal").ok().and_then(|b| parse_vmtotal(&b)).unwrap_or_default(),
-            superpages: superpages(),
+            runq,
+            superpages,
             disks,
             partitions,
             nets,
             filesystems,
             processes,
             sensors: self.sensors(),
-            tcp: self.ok("tcp", tcp()).flatten(),
+            tcp: tcp_snap,
+            udp: udp_snap,
             jails: self.ok("jails", jails()).unwrap_or_default(),
             zfs: self.zfs(),
             nfs,
         }
+    }
+
+    fn collect_nfs(&mut self) -> Option<Nfs> {
+        let raw = self.mibs.nfs_stats.raw().ok();
+        if let (Some(bytes), Some((prev_bytes, cached))) = (&raw, &self.nfs_cache)
+            && bytes == prev_bytes
+        {
+            return Some(cached.clone());
+        }
+        let parsed = self.ok("nfs", nfs())?;
+        if let Some(bytes) = raw {
+            self.nfs_cache = Some((bytes, parsed.clone()));
+        }
+        Some(parsed)
     }
 
     fn partitions(&mut self, disks: &[Disk]) -> Vec<Disk> {
@@ -296,7 +528,7 @@ impl Collector {
         if self.battery.as_ref().is_none_or(|(t, _)| t.elapsed() >= BATTERY_REFRESH) {
             self.battery = Some((Instant::now(), battery()));
         }
-        let mut s = sensors(self.host.ncpu);
+        let mut s = sensors(&self.mibs);
         s.battery = self.battery.as_ref().and_then(|(_, b)| b.clone());
         s
     }
@@ -313,8 +545,7 @@ impl Collector {
     }
 
     fn zfs(&mut self) -> Option<Zfs> {
-        let arc = |n: &str| sysctl_uint(&format!("kstat.zfs.misc.arcstats.{n}")).ok();
-        let size = arc("size")?;
+        let size = self.mibs.arc_size.uint().ok()?;
         let written = |c: &ZpoolCache| -> u64 { c.mibs.iter().map(|m| pool_io(m)[1]).sum() };
         let stale = match &self.zpools {
             None => true,
@@ -340,16 +571,21 @@ impl Collector {
         let mut pools = cache.pools.clone();
         for (pool, mibs) in pools.iter_mut().zip(&cache.mibs) {
             [pool.read_bytes, pool.write_bytes, pool.read_ops, pool.write_ops] = pool_io(mibs);
+            if let Ok(state) = sysctl_string(&format!("kstat.zfs.{}.misc.state", pool.name))
+                && !state.is_empty()
+            {
+                pool.health = state;
+            }
         }
         Some(Zfs {
             arc_size: size,
-            arc_target: arc("c").unwrap_or(0),
-            arc_max: arc("c_max").unwrap_or(0),
-            arc_hits: arc("hits").unwrap_or(0),
-            arc_misses: arc("misses").unwrap_or(0),
-            l2_size: arc("l2_size").unwrap_or(0),
-            l2_hits: arc("l2_hits").unwrap_or(0),
-            l2_misses: arc("l2_misses").unwrap_or(0),
+            arc_target: self.mibs.arc_c.uint_or_zero(),
+            arc_max: self.mibs.arc_c_max.uint_or_zero(),
+            arc_hits: self.mibs.arc_hits.uint_or_zero(),
+            arc_misses: self.mibs.arc_misses.uint_or_zero(),
+            l2_size: self.mibs.arc_l2_size.uint_or_zero(),
+            l2_hits: self.mibs.arc_l2_hits.uint_or_zero(),
+            l2_misses: self.mibs.arc_l2_misses.uint_or_zero(),
             pools,
         })
     }
@@ -387,8 +623,8 @@ fn lookup_user(uid: u32) -> String {
     }
 }
 
-fn cpu_ticks() -> Result<Vec<CpuTicks>> {
-    Ok(parse_cp_times(&sysctl_raw("kern.cp_times")?))
+fn cpu_ticks(mibs: &Mibs) -> Result<Vec<CpuTicks>> {
+    Ok(parse_cp_times(&mibs.cp_times.raw()?))
 }
 
 /// kern.cp_times: CPUSTATES `long`s per CPU.
@@ -416,18 +652,18 @@ pub(crate) fn parse_cp_times(buf: &[u8]) -> Vec<CpuTicks> {
         .collect()
 }
 
-fn memory(host: &HostInfo) -> Result<Memory> {
-    let pages = |name: &str| -> Result<u64> {
-        Ok(sysctl_uint(&format!("vm.stats.vm.{name}")).with_context(|| name.to_string())? * host.pagesize)
+fn memory(host: &HostInfo, mibs: &Mibs) -> Result<Memory> {
+    let pages = |m: &Mib, name: &str| -> Result<u64> {
+        Ok(m.uint().with_context(|| name.to_string())? * host.pagesize)
     };
     Ok(Memory {
-        total: pages("v_page_count")?,
-        active: pages("v_active_count")?,
-        inactive: pages("v_inactive_count")?,
-        laundry: pages("v_laundry_count").unwrap_or(0),
-        wired: pages("v_wire_count")?,
-        free: pages("v_free_count")?,
-        arc: sysctl_uint("kstat.zfs.misc.arcstats.size").ok(),
+        total: pages(&mibs.v_page_count, "v_page_count")?,
+        active: pages(&mibs.v_active_count, "v_active_count")?,
+        inactive: pages(&mibs.v_inactive_count, "v_inactive_count")?,
+        laundry: pages(&mibs.v_laundry_count, "v_laundry_count").unwrap_or(0),
+        wired: pages(&mibs.v_wire_count, "v_wire_count")?,
+        free: pages(&mibs.v_free_count, "v_free_count")?,
+        arc: mibs.arc_size.uint().ok(),
     })
 }
 
@@ -470,30 +706,29 @@ fn swap(pagesize: u64) -> Result<Vec<SwapDev>> {
     Ok(devs)
 }
 
-fn vm_counters() -> VmCounters {
-    let get = |n: &str| sysctl_uint(n).unwrap_or(0);
+fn vm_counters(mibs: &Mibs) -> VmCounters {
     VmCounters {
-        context_switches: get("vm.stats.sys.v_swtch"),
-        interrupts: get("vm.stats.sys.v_intr"),
-        syscalls: get("vm.stats.sys.v_syscall"),
-        traps: get("vm.stats.sys.v_trap"),
-        forks: get("vm.stats.vm.v_forks") + get("vm.stats.vm.v_vforks") + get("vm.stats.vm.v_rforks"),
-        faults: get("vm.stats.vm.v_vm_faults"),
-        swap_pages_in: get("vm.stats.vm.v_swappgsin"),
-        swap_pages_out: get("vm.stats.vm.v_swappgsout"),
-        swap_ins: get("vm.stats.vm.v_swapin"),
-        swap_outs: get("vm.stats.vm.v_swapout"),
-        vnode_ins: get("vm.stats.vm.v_vnodein"),
-        vnode_outs: get("vm.stats.vm.v_vnodeout"),
-        vnode_pages_in: get("vm.stats.vm.v_vnodepgsin"),
-        vnode_pages_out: get("vm.stats.vm.v_vnodepgsout"),
-        zero_fill_faults: get("vm.stats.vm.v_zfod"),
-        cow_faults: get("vm.stats.vm.v_cow_faults"),
-        intransit_faults: get("vm.stats.vm.v_intrans"),
-        reactivated: get("vm.stats.vm.v_reactivated"),
-        pages_freed: get("vm.stats.vm.v_tfree"),
-        pageout_wakeups: get("vm.stats.vm.v_pdwakeups"),
-        pageout_scanned: get("vm.stats.vm.v_pdpages"),
+        context_switches: mibs.v_swtch.uint_or_zero(),
+        interrupts: mibs.v_intr.uint_or_zero(),
+        syscalls: mibs.v_syscall.uint_or_zero(),
+        traps: mibs.v_trap.uint_or_zero(),
+        forks: mibs.v_forks.uint_or_zero() + mibs.v_vforks.uint_or_zero() + mibs.v_rforks.uint_or_zero(),
+        faults: mibs.v_vm_faults.uint_or_zero(),
+        swap_pages_in: mibs.v_swappgsin.uint_or_zero(),
+        swap_pages_out: mibs.v_swappgsout.uint_or_zero(),
+        swap_ins: mibs.v_swapin.uint_or_zero(),
+        swap_outs: mibs.v_swapout.uint_or_zero(),
+        vnode_ins: mibs.v_vnodein.uint_or_zero(),
+        vnode_outs: mibs.v_vnodeout.uint_or_zero(),
+        vnode_pages_in: mibs.v_vnodepgsin.uint_or_zero(),
+        vnode_pages_out: mibs.v_vnodepgsout.uint_or_zero(),
+        zero_fill_faults: mibs.v_zfod.uint_or_zero(),
+        cow_faults: mibs.v_cow_faults.uint_or_zero(),
+        intransit_faults: mibs.v_intrans.uint_or_zero(),
+        reactivated: mibs.v_reactivated.uint_or_zero(),
+        pages_freed: mibs.v_tfree.uint_or_zero(),
+        pageout_wakeups: mibs.v_pdwakeups.uint_or_zero(),
+        pageout_scanned: mibs.v_pdpages.uint_or_zero(),
     }
 }
 
@@ -507,14 +742,13 @@ pub(crate) fn parse_vmtotal(buf: &[u8]) -> Option<RunQueue> {
     Some(RunQueue { runnable: at(72)?, disk_wait: at(74)?, page_wait: at(76)?, sleeping: at(78)? })
 }
 
-fn superpages() -> Option<Superpages> {
-    let get = |n: &str| sysctl_uint(&format!("vm.pmap.pde.{n}")).ok();
+fn superpages(mibs: &Mibs) -> Option<Superpages> {
     Some(Superpages {
-        enabled: sysctl_int("vm.pmap.pg_ps_enabled").unwrap_or(0) != 0,
-        mappings: get("mappings")?,
-        promotions: get("promotions")?,
-        demotions: get("demotions")?,
-        failures: get("p_failures").unwrap_or(0),
+        enabled: mibs.pg_ps_enabled.int().unwrap_or(0) != 0,
+        mappings: mibs.pde_mappings.uint().ok()?,
+        promotions: mibs.pde_promotions.uint().ok()?,
+        demotions: mibs.pde_demotions.uint().ok()?,
+        failures: mibs.pde_failures.uint_or_zero(),
     })
 }
 
@@ -533,8 +767,8 @@ fn uptime() -> f64 {
     ts.tv_sec as f64 + ts.tv_nsec as f64 / 1e9
 }
 
-fn disks() -> Result<Vec<Disk>> {
-    Ok(parse_devstat(&sysctl_raw("kern.devstat.all")?))
+fn disks(mibs: &Mibs) -> Result<Vec<Disk>> {
+    Ok(parse_devstat(&mibs.devstat_all.raw()?))
 }
 
 /// kern.devstat.all: a `long` generation number followed by the devstat array.
@@ -671,6 +905,12 @@ pub(crate) fn parse_procs(buf: &[u8], pagesize: u64) -> Result<(Vec<Process>, Ve
             if k.ki_flag & libc::P_SYSTEM as libc::c_long != 0 && command == "idle" {
                 return None;
             }
+            let tv_us = |tv: &libc::timeval| {
+                (tv.tv_sec.max(0) as u64).saturating_mul(1_000_000) + (tv.tv_usec.max(0) as u64)
+            };
+            let start_time = (k.ki_start.tv_sec as i64)
+                .saturating_mul(1_000_000)
+                .saturating_add(k.ki_start.tv_usec as i64);
             let p = Process {
                 pid: k.ki_pid,
                 ppid: k.ki_ppid,
@@ -681,7 +921,10 @@ pub(crate) fn parse_procs(buf: &[u8], pagesize: u64) -> Result<(Vec<Process>, Ve
                 jid: k.ki_jid,
                 state: proc_state(k.ki_stat),
                 threads: k.ki_numthreads.max(0) as u32,
+                start_time,
                 cpu_time_us: k.ki_runtime,
+                user_time_us: tv_us(&k.ki_rusage.ru_utime),
+                sys_time_us: tv_us(&k.ki_rusage.ru_stime),
                 rss: k.ki_rssize.max(0) as u64 * pagesize,
                 vsize: k.ki_size as u64,
                 read_ops: k.ki_rusage.ru_inblock.max(0) as u64,
@@ -689,7 +932,7 @@ pub(crate) fn parse_procs(buf: &[u8], pagesize: u64) -> Result<(Vec<Process>, Ve
                 minor_faults: k.ki_rusage.ru_minflt.max(0) as u64,
                 major_faults: k.ki_rusage.ru_majflt.max(0) as u64,
             };
-            Some((p, k.ki_start.tv_sec as i64))
+            Some((p, start_time))
         })
         .unzip())
 }
@@ -716,16 +959,24 @@ fn sysctl_celsius(name: &str) -> Option<f64> {
 }
 
 fn sysctl_int(name: &str) -> Option<i64> {
-    let buf = sysctl_raw(name).ok()?;
-    match buf.len() {
+    let cname = CString::new(name).ok()?;
+    let mut buf = [0u8; 8];
+    let mut len: libc::size_t = buf.len();
+    let rc = unsafe {
+        libc::sysctlbyname(cname.as_ptr(), buf.as_mut_ptr().cast(), &mut len, std::ptr::null(), 0)
+    };
+    if rc != 0 {
+        return None;
+    }
+    match len {
         4 => Some(i32::from_ne_bytes(buf[..4].try_into().unwrap()) as i64),
-        8 => Some(i64::from_ne_bytes(buf[..8].try_into().unwrap())),
+        8 => Some(i64::from_ne_bytes(buf)),
         _ => None,
     }
 }
 
-fn sensors(ncpu: usize) -> Sensors {
-    let cpu_temps: Vec<f64> = (0..ncpu).map_while(|i| sysctl_celsius(&format!("dev.cpu.{i}.temperature"))).collect();
+fn sensors(mibs: &Mibs) -> Sensors {
+    let cpu_temps: Vec<f64> = mibs.cpu_temps.iter().map_while(Mib::celsius).collect();
     let thermal_zones = (0..)
         .map_while(|i| {
             let base = format!("hw.acpi.thermal.tz{i}");
@@ -734,11 +985,13 @@ fn sensors(ncpu: usize) -> Sensors {
         })
         .filter_map(|(n, t)| Some((n, t?)))
         .collect();
+    let cpu_freqs_mhz: Vec<u64> =
+        mibs.cpu_freqs.iter().map_while(Mib::int).map(|f| f.max(0) as u64).collect();
     Sensors {
         cpu_temps,
-        cpu_tjmax: sysctl_celsius("dev.cpu.0.coretemp.tjmax"),
-        cpu_freq_mhz: sysctl_int("dev.cpu.0.freq").map(|f| f.max(0) as u64),
-        cpu_freqs_mhz: (0..ncpu).map_while(|i| sysctl_int(&format!("dev.cpu.{i}.freq"))).map(|f| f.max(0) as u64).collect(),
+        cpu_tjmax: mibs.cpu_tjmax.celsius(),
+        cpu_freq_mhz: cpu_freqs_mhz.first().copied(),
+        cpu_freqs_mhz,
         thermal_zones,
         battery: None,
     }
@@ -783,10 +1036,29 @@ const TCP_STATES: [&str; 11] = [
     "time_wait",
 ];
 
-fn tcp() -> Result<Option<Tcp>> {
-    let stats = sysctl_raw("net.inet.tcp.stats")?;
-    let states = sysctl_raw("net.inet.tcp.states").unwrap_or_default();
+fn tcp(mibs: &Mibs) -> Result<Option<Tcp>> {
+    let stats = mibs.tcp_stats.raw()?;
+    let states = mibs.tcp_states.raw().unwrap_or_default();
     Ok(parse_tcp(&stats, &states))
+}
+
+fn udp(mibs: &Mibs) -> Option<Udp> {
+    parse_udp(&mibs.udp_stats.raw().ok()?)
+}
+
+/// `struct udpstat` from <netinet/udp_var.h>: uint64_t counters.
+pub(crate) fn parse_udp(stats: &[u8]) -> Option<Udp> {
+    let v: Vec<u64> = stats.as_chunks::<8>().0.iter().map(|c| u64::from_ne_bytes(*c)).collect();
+    if v.len() <= 9 {
+        return None;
+    }
+    Some(Udp {
+        datagrams_in: v[0],
+        in_errors: v[1].saturating_add(v[2]).saturating_add(v[4]),
+        no_ports: v[5],
+        full_socket_buffers: v[7],
+        datagrams_out: v[9],
+    })
 }
 
 /// `struct tcpstat` is all uint64_t counters; indices from <netinet/tcp_var.h>.
@@ -907,10 +1179,8 @@ fn pool_io(mibs: &[[Vec<libc::c_int>; 4]]) -> [u64; 4] {
     let mut out = [0u64; 4];
     for set in mibs {
         for (total, mib) in out.iter_mut().zip(set) {
-            if let Ok(buf) = sysctl_mib_raw(mib)
-                && buf.len() == 8
-            {
-                *total += u64::from_ne_bytes(buf[..8].try_into().unwrap());
+            if let Ok(v) = sysctl_mib_uint(mib) {
+                *total += v;
             }
         }
     }
@@ -1249,5 +1519,20 @@ mod fixtures_more {
         assert!(nfs.client_ops.iter().any(|(op, _)| op == "getattr"));
         assert_eq!(nfs.server_ops.len(), 21);
         assert!(parse_nfsstat(b"not json").is_err());
+    }
+
+    #[test]
+    fn udpstat_counters() {
+        let mut raw = Vec::new();
+        for v in [100u64, 1, 2, 0, 3, 5, 0, 7, 0, 200] {
+            raw.extend_from_slice(&v.to_ne_bytes());
+        }
+        let u = parse_udp(&raw).unwrap();
+        assert_eq!(u.datagrams_in, 100);
+        assert_eq!(u.in_errors, 6);
+        assert_eq!(u.no_ports, 5);
+        assert_eq!(u.full_socket_buffers, 7);
+        assert_eq!(u.datagrams_out, 200);
+        assert!(parse_udp(&[0u8; 32]).is_none());
     }
 }

@@ -69,6 +69,10 @@ pub struct Cli {
     #[arg(long)]
     rotate: bool,
 
+    /// With --rotate, compress finished daily files with gzip
+    #[arg(long)]
+    record_compress: bool,
+
     /// With --rotate, delete this host's recordings older than DAYS
     #[arg(long, value_name = "DAYS")]
     record_keep: Option<u64>,
@@ -164,6 +168,7 @@ fn main() -> Result<()> {
             interval: cli.interval,
             count: cli.count,
             rotate: cli.rotate,
+            compress: cli.record_compress,
             keep_days: cli.record_keep,
             groups: cli.disk_groups.clone(),
         };
@@ -212,7 +217,15 @@ fn main() -> Result<()> {
     if screen {
         // Signals stop the screen through the hub so it can restore the terminal.
         rt.spawn(wait_for_shutdown(hub.clone()));
-        tui::run(hub.clone(), &cli.show, status, ring, cli.disk_groups.clone())?;
+        tui::run(
+            hub.clone(),
+            &cli.show,
+            status,
+            ring,
+            cli.disk_groups.clone(),
+            cli.record_dir.clone(),
+            cli.record_format,
+        )?;
     } else {
         info!("jmon {} running headless, interval {}s", env!("CARGO_PKG_VERSION"), cli.interval);
         rt.block_on(wait_for_shutdown(hub.clone()));
@@ -243,8 +256,22 @@ fn once(mut collector: platform::Collector) -> Result<()> {
     Ok(())
 }
 
-/// Waits for SIGINT, SIGTERM, SIGHUP, or the sampler finishing, then asks
-/// everything to stop.
+/// Reloads runtime-adjustable settings (interval, export-top) from the config file on SIGHUP.
+#[cfg(unix)]
+fn reload_config(hub: &Hub) {
+    match config::args().and_then(|a| Cli::try_parse_from(a).map_err(Into::into)) {
+        Ok(cli) if cli.interval.is_finite() && cli.interval > 0.0 => {
+            hub.set_interval(Duration::from_secs_f64(cli.interval));
+            hub.set_top_procs(cli.export_top);
+            info!("SIGHUP: reloaded config (interval={}s, export-top={})", cli.interval, cli.export_top);
+        }
+        Ok(_) => warn!("SIGHUP: ignoring non-positive interval in config"),
+        Err(e) => warn!("SIGHUP: config reload failed: {e:#}"),
+    }
+}
+
+/// Waits for SIGINT, SIGTERM, or the sampler finishing, then asks everything to
+/// stop. On Unix, SIGHUP reloads the configuration file without stopping.
 async fn wait_for_shutdown(hub: Arc<Hub>) {
     let stopped = {
         let hub = hub.clone();
@@ -255,16 +282,19 @@ async fn wait_for_shutdown(hub: Arc<Hub>) {
         }
     };
     #[cfg(unix)]
-    let signals = async {
-        use tokio::signal::unix::{SignalKind, signal};
-        match (signal(SignalKind::terminate()), signal(SignalKind::hangup())) {
-            (Ok(mut term), Ok(mut hup)) => {
-                tokio::select! {
-                    _ = term.recv() => "SIGTERM",
-                    _ = hup.recv() => "SIGHUP",
-                }
+    let signals = {
+        let hub = hub.clone();
+        async move {
+            use tokio::signal::unix::{SignalKind, signal};
+            match (signal(SignalKind::terminate()), signal(SignalKind::hangup())) {
+                (Ok(mut term), Ok(mut hup)) => loop {
+                    tokio::select! {
+                        _ = term.recv() => break "SIGTERM",
+                        _ = hup.recv() => reload_config(&hub),
+                    }
+                },
+                _ => std::future::pending().await,
             }
-            _ => std::future::pending().await,
         }
     };
     #[cfg(not(unix))]

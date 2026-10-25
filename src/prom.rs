@@ -5,9 +5,14 @@ use crate::sample::{Hub, Sample};
 use std::fmt::Write as _;
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
+use tokio::sync::Semaphore;
 use tracing::{debug, info, warn};
+
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
+const MAX_CONCURRENT_REQUESTS: usize = 64;
 
 /// Prometheus naming: dots to underscores, unit suffix, `_total` for counters.
 pub fn prom_name(name: &str, unit: &str, kind: Kind) -> String {
@@ -68,51 +73,76 @@ pub fn render(s: &Sample, hub: &Hub) -> String {
 
 pub async fn serve(addr: SocketAddr, hub: Arc<Hub>) -> std::io::Result<()> {
     let listener = TcpListener::bind(addr).await?;
+    let limit = Arc::new(Semaphore::new(MAX_CONCURRENT_REQUESTS));
     info!("serving Prometheus metrics on http://{addr}/metrics");
     loop {
         let (mut sock, peer) = listener.accept().await?;
+        let Ok(permit) = limit.clone().try_acquire_owned() else {
+            debug!("prometheus {peer}: dropping connection (too many concurrent requests)");
+            continue;
+        };
         let hub = hub.clone();
         tokio::spawn(async move {
-            let mut buf = vec![0u8; 8192];
-            let mut n = 0;
-            // Read just the request head; bodies aren't expected.
-            while n < buf.len() {
-                match sock.read(&mut buf[n..]).await {
-                    Ok(0) => break,
-                    Ok(k) => n += k,
-                    Err(e) => {
-                        debug!("prometheus {peer}: {e}");
-                        return;
+            let _permit = permit;
+            let _ = tokio::time::timeout(REQUEST_TIMEOUT, async {
+                let mut buf = vec![0u8; 8192];
+                let mut n = 0;
+                // Read just the request head; bodies aren't expected.
+                while n < buf.len() {
+                    match sock.read(&mut buf[n..]).await {
+                        Ok(0) => break,
+                        Ok(k) => n += k,
+                        Err(e) => {
+                            debug!("prometheus {peer}: {e}");
+                            return;
+                        }
+                    }
+                    if buf[..n].windows(4).any(|w| w == b"\r\n\r\n") {
+                        break;
                     }
                 }
-                if buf[..n].windows(4).any(|w| w == b"\r\n\r\n") {
-                    break;
+                let head = String::from_utf8_lossy(&buf[..n]);
+                let mut parts = head.lines().next().unwrap_or("").split_whitespace();
+                let method = parts.next().unwrap_or("GET");
+                let path = parts.next().unwrap_or("/");
+                if method != "GET" && method != "HEAD" {
+                    let resp = "HTTP/1.1 405 Method Not Allowed\r\nAllow: GET, HEAD\r\nContent-Type: text/plain\r\nContent-Length: 19\r\nConnection: close\r\n\r\nmethod not allowed\n";
+                    let _ = sock.write_all(resp.as_bytes()).await;
+                    return;
                 }
-            }
-            let head = String::from_utf8_lossy(&buf[..n]);
-            let path = head.split_whitespace().nth(1).unwrap_or("/");
-            let (status, ctype, body) = match path.split('?').next().unwrap_or("/") {
-                "/metrics" => match hub.latest() {
-                    Some(s) => {
-                        hub.stats.scrapes.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                        ("200 OK", "text/plain; version=0.0.4; charset=utf-8", render(&s, &hub))
-                    }
-                    None => ("503 Service Unavailable", "text/plain", "no sample yet\n".into()),
-                },
-                "/" => (
-                    "200 OK",
-                    "text/html",
-                    "<html><body><h1>jmon</h1><a href=\"/metrics\">metrics</a></body></html>\n".into(),
-                ),
-                _ => ("404 Not Found", "text/plain", "not found\n".into()),
-            };
-            let resp = format!(
-                "HTTP/1.1 {status}\r\nContent-Type: {ctype}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
-                body.len()
-            );
-            if let Err(e) = sock.write_all(resp.as_bytes()).await {
-                warn!("prometheus {peer}: {e}");
-            }
+                let (status, ctype, body) = match path.split('?').next().unwrap_or("/") {
+                    "/metrics" => match hub.latest() {
+                        Some(s) => {
+                            if method == "GET" {
+                                hub.stats.scrapes.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            }
+                            ("200 OK", "text/plain; version=0.0.4; charset=utf-8", render(&s, &hub))
+                        }
+                        None => ("503 Service Unavailable", "text/plain", "no sample yet\n".into()),
+                    },
+                    "/" => (
+                        "200 OK",
+                        "text/html",
+                        "<html><body><h1>jmon</h1><a href=\"/metrics\">metrics</a></body></html>\n".into(),
+                    ),
+                    _ => ("404 Not Found", "text/plain", "not found\n".into()),
+                };
+                let resp = if method == "HEAD" {
+                    format!(
+                        "HTTP/1.1 {status}\r\nContent-Type: {ctype}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                        body.len()
+                    )
+                } else {
+                    format!(
+                        "HTTP/1.1 {status}\r\nContent-Type: {ctype}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    )
+                };
+                if let Err(e) = sock.write_all(resp.as_bytes()).await {
+                    warn!("prometheus {peer}: {e}");
+                }
+            })
+            .await;
         });
     }
 }

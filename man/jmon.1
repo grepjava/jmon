@@ -95,10 +95,16 @@ sort top processes by CPU, memory or I/O
 show full command lines in the process list
 .It Cm u
 show only one user's processes
+.It Cm /
+search processes by command, arguments, user or jail
 .It Cm \&.
 hide idle CPUs, disks, interfaces and processes
 .It Cm p
 pause and resume
+.It Cm w
+start or stop an nmon recording in the record directory
+.It Cm Up , Down , PgUp , PgDn , Home , End
+scroll panels or the process list vertically
 .It Cm v
 checks: each statistic with an ok, warning or danger verdict
 .It Cm 0
@@ -157,6 +163,11 @@ recordings.
 With
 .Fl f ,
 start a new file every day at local midnight.
+.It Fl -record-compress
+With
+.Fl -rotate ,
+compress finished daily files with
+.Xr gzip 1 .
 .It Fl -record-keep Ar days
 With
 .Fl -rotate ,

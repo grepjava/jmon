@@ -6,7 +6,8 @@ use crate::model::*;
 use crate::platform::Collector;
 use serde::Serialize;
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex, OnceLock, RwLock};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
@@ -131,6 +132,10 @@ pub struct Rates {
     pub nfs: Option<NfsRates>,
     /// Percent of one CPU, like top(1); can exceed 100 for threaded processes.
     pub proc_cpu: Vec<f64>,
+    /// User-mode CPU percent per process.
+    pub proc_user_cpu: Vec<f64>,
+    /// System-mode CPU percent per process.
+    pub proc_sys_cpu: Vec<f64>,
     /// Block I/O operations per second (reads + writes), aligned with processes.
     pub proc_io: Vec<f64>,
     /// (minor, major) page faults per second, aligned with processes.
@@ -140,6 +145,7 @@ pub struct Rates {
     /// bhyve virtual machines, found by their `bhyve: <name>` process titles.
     pub vms: Vec<GroupRate>,
     pub tcp: Option<TcpRates>,
+    pub udp: Option<UdpRates>,
     pub zfs: Option<ZfsRates>,
 }
 
@@ -163,6 +169,15 @@ pub struct TcpRates {
     pub listen_drops: f64,
     pub accepts: f64,
     pub conn_attempts: f64,
+}
+
+#[derive(Debug, Clone, Copy, Default, Serialize)]
+pub struct UdpRates {
+    pub datagrams_in: f64,
+    pub datagrams_out: f64,
+    pub in_errors: f64,
+    pub no_ports: f64,
+    pub full_socket_buffers: f64,
 }
 
 #[derive(Debug, Clone, Default, Serialize)]
@@ -204,10 +219,14 @@ impl Sample {
         Sample { seq, host, snap, rates, collect_secs: 0.0, families: OnceLock::new() }
     }
 
-    /// Metric families for exporters, computed once per sample (so jmon's own
-    /// counters in it can lag by up to one interval).
+    /// Metric families for exporters, computed once per sample while refreshing
+    /// jmon's own scrape/export counters on every call.
     pub fn families(&self, hub: &Hub) -> Arc<Families> {
-        self.families.get_or_init(|| Arc::new(metrics::collect(self, hub.top_procs, &hub.stats))).clone()
+        let base = self
+            .families
+            .get_or_init(|| Arc::new(metrics::collect(self, hub.top_procs(), &hub.stats)))
+            .clone();
+        metrics::with_live_self_stats(base, &hub.stats)
     }
 
     /// Process indices ordered by CPU usage, busiest first.
@@ -316,14 +335,28 @@ fn rates(prev: &Snapshot, cur: &Snapshot) -> Option<Rates> {
         _ => None,
     };
 
-    let prev_procs: HashMap<i32, &Process> = prev.processes.iter().map(|p| (p.pid, p)).collect();
+    let prev_procs: HashMap<(i32, i64), &Process> =
+        prev.processes.iter().map(|p| ((p.pid, p.start_time), p)).collect();
     let mut proc_cpu = Vec::with_capacity(cur.processes.len());
+    let mut proc_user_cpu = Vec::with_capacity(cur.processes.len());
+    let mut proc_sys_cpu = Vec::with_capacity(cur.processes.len());
     let mut proc_io = Vec::with_capacity(cur.processes.len());
     let mut proc_faults = Vec::with_capacity(cur.processes.len());
     for p in &cur.processes {
-        match prev_procs.get(&p.pid) {
+        match prev_procs.get(&(p.pid, p.start_time)) {
             Some(q) => {
-                proc_cpu.push(p.cpu_time_us.saturating_sub(q.cpu_time_us) as f64 / (secs * 1e4));
+                let total = p.cpu_time_us.saturating_sub(q.cpu_time_us) as f64 / (secs * 1e4);
+                let u_us = p.user_time_us.saturating_sub(q.user_time_us);
+                let s_us = p.sys_time_us.saturating_sub(q.sys_time_us);
+                let (usr, sys) = if u_us + s_us > 0 {
+                    let sum = (u_us + s_us) as f64;
+                    (total * (u_us as f64 / sum), total * (s_us as f64 / sum))
+                } else {
+                    (total, 0.0)
+                };
+                proc_cpu.push(total);
+                proc_user_cpu.push(usr);
+                proc_sys_cpu.push(sys);
                 proc_io.push(per_sec(p.read_ops + p.write_ops, q.read_ops + q.write_ops, secs));
                 proc_faults.push((
                     per_sec(p.minor_faults, q.minor_faults, secs),
@@ -332,6 +365,8 @@ fn rates(prev: &Snapshot, cur: &Snapshot) -> Option<Rates> {
             }
             None => {
                 proc_cpu.push(0.0);
+                proc_user_cpu.push(0.0);
+                proc_sys_cpu.push(0.0);
                 proc_io.push(0.0);
                 proc_faults.push((0.0, 0.0));
             }
@@ -387,6 +422,17 @@ fn rates(prev: &Snapshot, cur: &Snapshot) -> Option<Rates> {
         _ => None,
     };
 
+    let udp = match (&cur.udp, &prev.udp) {
+        (Some(u), Some(q)) => Some(UdpRates {
+            datagrams_in: per_sec(u.datagrams_in, q.datagrams_in, secs),
+            datagrams_out: per_sec(u.datagrams_out, q.datagrams_out, secs),
+            in_errors: per_sec(u.in_errors, q.in_errors, secs),
+            no_ports: per_sec(u.no_ports, q.no_ports, secs),
+            full_socket_buffers: per_sec(u.full_socket_buffers, q.full_socket_buffers, secs),
+        }),
+        _ => None,
+    };
+
     let zfs = match (&cur.zfs, &prev.zfs) {
         (Some(z), Some(q)) => {
             let hits = z.arc_hits.saturating_sub(q.arc_hits) as f64;
@@ -424,11 +470,14 @@ fn rates(prev: &Snapshot, cur: &Snapshot) -> Option<Rates> {
         superpages,
         nfs,
         proc_cpu,
+        proc_user_cpu,
+        proc_sys_cpu,
         proc_io,
         proc_faults,
         jails,
         vms,
         tcp,
+        udp,
         zfs,
     })
 }
@@ -500,7 +549,8 @@ pub struct Hub {
     interval_ms: AtomicU64,
     stop: Mutex<bool>,
     wake: Condvar,
-    pub top_procs: usize,
+    top_procs: AtomicUsize,
+    live_sink: Mutex<Option<(PathBuf, Box<dyn Sink>)>>,
 }
 
 impl Hub {
@@ -510,9 +560,26 @@ impl Hub {
             interval_ms: AtomicU64::new(interval.as_millis().max(100) as u64),
             stop: Mutex::new(false),
             wake: Condvar::new(),
-            top_procs,
+            top_procs: AtomicUsize::new(top_procs),
+            live_sink: Mutex::new(None),
             stats: SelfStats::default(),
         })
+    }
+
+    pub fn top_procs(&self) -> usize {
+        self.top_procs.load(Ordering::Relaxed)
+    }
+
+    pub fn set_top_procs(&self, top_procs: usize) {
+        self.top_procs.store(top_procs, Ordering::Relaxed);
+    }
+
+    pub fn recording_path(&self) -> Option<PathBuf> {
+        self.live_sink.lock().unwrap().as_ref().map(|(p, _)| p.clone())
+    }
+
+    pub fn set_live_sink(&self, sink: Option<(PathBuf, Box<dyn Sink>)>) {
+        *self.live_sink.lock().unwrap() = sink;
     }
 
     pub fn latest(&self) -> Option<Arc<Sample>> {
@@ -600,6 +667,11 @@ pub fn spawn(hub: Arc<Hub>, mut collector: Collector, mut sinks: Vec<Box<dyn Sin
                         warn!("recording sample: {e}");
                     }
                 }
+                if let Some((_, ref mut s)) = *hub.live_sink.lock().unwrap()
+                    && let Err(e) = s.write(&sample)
+                {
+                    warn!("recording sample: {e}");
+                }
                 if count.is_some_and(|c| seq >= c) {
                     hub.request_stop();
                     break;
@@ -613,4 +685,79 @@ pub fn spawn(hub: Arc<Hub>, mut collector: Collector, mut sinks: Vec<Box<dyn Sin
             }
         })
         .expect("spawn sampler thread")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::metrics::M;
+
+    fn test_host() -> Arc<HostInfo> {
+        Arc::new(HostInfo {
+            hostname: "h".into(),
+            os_type: "freebsd".into(),
+            os_release: "14.3".into(),
+            machine: "amd64".into(),
+            cpu_model: "cpu".into(),
+            ncpu: 2,
+            physmem: 1 << 30,
+            pagesize: 4096,
+            demo: true,
+        })
+    }
+
+    #[test]
+    fn pid_reuse_does_not_inherit_previous_process_counters() {
+        let mut prev = Snapshot::empty();
+        prev.processes.push(Process {
+            pid: 100,
+            start_time: 1000,
+            cpu_time_us: 500_000,
+            user_time_us: 400_000,
+            sys_time_us: 100_000,
+            ..Default::default()
+        });
+        let mut cur = Snapshot::empty();
+        cur.taken = prev.taken + Duration::from_secs(1);
+        // Same PID (100), different start_time (2000): recycled PID.
+        cur.processes.push(Process {
+            pid: 100,
+            start_time: 2000,
+            cpu_time_us: 900_000,
+            user_time_us: 800_000,
+            sys_time_us: 100_000,
+            ..Default::default()
+        });
+        let s = Sample::derive(1, test_host(), Some(&prev), cur);
+        let r = s.rates.as_ref().unwrap();
+        assert_eq!(r.proc_cpu[0], 0.0);
+
+        // Matching start_time computes user/sys split accurately.
+        let mut cur2 = Snapshot::empty();
+        cur2.taken = prev.taken + Duration::from_secs(1);
+        cur2.processes.push(Process {
+            pid: 100,
+            start_time: 1000,
+            cpu_time_us: 1_000_000,
+            user_time_us: 800_000,
+            sys_time_us: 200_000,
+            ..Default::default()
+        });
+        let s2 = Sample::derive(2, test_host(), Some(&prev), cur2);
+        let r2 = s2.rates.as_ref().unwrap();
+        assert!((r2.proc_cpu[0] - 50.0).abs() < 1e-6);
+        assert!((r2.proc_user_cpu[0] - 40.0).abs() < 1e-6);
+        assert!((r2.proc_sys_cpu[0] - 10.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn families_refresh_live_self_stats() {
+        let hub = Hub::new(Duration::from_secs(1), 0);
+        let s = Sample::derive(1, test_host(), None, Snapshot::empty());
+        assert!(s.families(&hub)[M::SelfScrapes as usize].is_empty());
+        hub.stats.scrapes.fetch_add(3, Ordering::Relaxed);
+        assert_eq!(s.families(&hub)[M::SelfScrapes as usize][0].value, 3.0);
+        hub.set_top_procs(5);
+        assert_eq!(hub.top_procs(), 5);
+    }
 }
