@@ -22,7 +22,7 @@ use sample::{Hub, Sample, Sink};
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tracing::{info, warn};
 use tracing_subscriber::EnvFilter;
 
@@ -217,15 +217,39 @@ fn main() -> Result<()> {
     if screen {
         // Signals stop the screen through the hub so it can restore the terminal.
         rt.spawn(wait_for_shutdown(hub.clone(), false));
-        tui::run(
-            hub.clone(),
-            &cli.show,
-            status,
-            ring,
-            cli.disk_groups.clone(),
-            cli.record_dir.clone(),
-            cli.record_format,
-        )?;
+        let watch_tty = stdin_is_tty();
+        let screen = {
+            let hub = hub.clone();
+            let show = cli.show.clone();
+            let groups = cli.disk_groups.clone();
+            let record_dir = cli.record_dir.clone();
+            let record_format = cli.record_format;
+            std::thread::Builder::new()
+                .name("jmon-screen".into())
+                .spawn(move || tui::run(hub, &show, status, ring, groups, record_dir, record_format))?
+        };
+        // crossterm 0.29 reads a hung-up terminal forever (read returns 0 and
+        // it only stops on EWOULDBLOCK), so the screen thread never sees a
+        // stop request. Watch from here and leave it behind once the terminal
+        // is gone or it ignores a stop, so recordings and OTLP still flush.
+        let mut stop_seen: Option<Instant> = None;
+        while !screen.is_finished() {
+            if watch_tty && !stdin_is_tty() {
+                warn!("terminal hung up, shutting down");
+                break;
+            }
+            if hub.stopped() && stop_seen.get_or_insert_with(Instant::now).elapsed() > Duration::from_secs(2) {
+                warn!("screen did not stop, shutting down without it");
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(200));
+        }
+        if screen.is_finished() {
+            screen.join().map_err(|_| anyhow::anyhow!("screen thread panicked"))??;
+        } else {
+            // Harmless on a terminal that is gone; otherwise leaves it usable.
+            ratatui::restore();
+        }
     } else {
         info!("jmon {} running headless, interval {}s", env!("CARGO_PKG_VERSION"), cli.interval);
         rt.block_on(wait_for_shutdown(hub.clone(), true));
@@ -254,6 +278,13 @@ fn once(mut collector: platform::Collector) -> Result<()> {
     serde_json::to_writer_pretty(std::io::stdout().lock(), &s)?;
     println!();
     Ok(())
+}
+
+/// Whether stdin is a terminal. After a hangup the kernel revokes the
+/// descriptor and this turns false.
+fn stdin_is_tty() -> bool {
+    use std::io::IsTerminal;
+    std::io::stdin().is_terminal()
 }
 
 /// Reloads runtime-adjustable settings (interval, export-top) from the config file on SIGHUP.
