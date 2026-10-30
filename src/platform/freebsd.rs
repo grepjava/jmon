@@ -606,10 +606,11 @@ impl Collector {
         let mut pools = cache.pools.clone();
         for (pool, mibs) in pools.iter_mut().zip(&cache.mibs) {
             [pool.read_bytes, pool.write_bytes, pool.read_ops, pool.write_ops] = pool_io(mibs);
+            // The kstat ends in a newline ("ONLINE\n").
             if let Ok(state) = sysctl_string(&format!("kstat.zfs.{}.misc.state", pool.name))
-                && !state.is_empty()
+                && !state.trim().is_empty()
             {
-                pool.health = state;
+                pool.health = state.trim().to_string();
             }
         }
         Some(Zfs {

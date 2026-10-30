@@ -1,6 +1,6 @@
 [package]
 name = "jmon"
-version = "0.1.4"
+version = "0.1.5"
 edition = "2024"
 description = "nmon-style system monitor for FreeBSD that emits OpenTelemetry metrics"
 license = "BSD-2-Clause"
