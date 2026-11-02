@@ -271,6 +271,11 @@ pub struct Collector {
     zpools: Option<ZpoolCache>,
     /// `zpool status`, refreshed like `zpool list` but faster during a scan.
     zpool_status: Option<StatusCache>,
+    /// The running `zpool iostat`, and when it was last started and why it
+    /// stopped or could not start.
+    iostat: Option<Iostat>,
+    iostat_started: Option<Instant>,
+    iostat_failure: Option<(Availability, String)>,
     /// Cached `vfs.nfs.nfsstats` bytes + parsed Nfs so idle NFS mounts do not spawn `nfsstat`.
     nfs_cache: Option<(Vec<u8>, Nfs)>,
     /// Battery sysctls run ACPI methods (~4 ms each), so read them rarely.
@@ -470,6 +475,9 @@ impl Collector {
             args: HashMap::new(),
             zpools: None,
             zpool_status: None,
+            iostat: None,
+            iostat_started: None,
+            iostat_failure: None,
             nfs_cache: None,
             battery: None,
             sensor_lookup: Instant::now(),
@@ -658,8 +666,59 @@ impl Collector {
         self.report("zpool", state, detail, started.elapsed().as_secs_f64());
         if !pools.is_empty() {
             self.attach_status(&mut pools);
+            self.attach_iostat(&mut pools);
         }
         pools
+    }
+
+    /// Adds the latest `zpool iostat` report, starting it when needed: when
+    /// the set of pools changes, and again after it exits (at most every
+    /// ZPOOL_REFRESH).
+    fn attach_iostat(&mut self, pools: &mut [ZPool]) {
+        let started = Instant::now();
+        let names: Vec<String> = pools.iter().map(|p| p.name.clone()).collect();
+        if let Some(i) = &mut self.iostat
+            && let Ok(Some(status)) = i.child.try_wait()
+        {
+            self.iostat_failure = Some((Availability::Failed, format!("zpool iostat exited with {status}")));
+            self.iostat = None;
+        }
+        let changed = self.iostat.as_ref().is_some_and(|i| i.pools != names);
+        let retry = self.iostat_started.is_none_or(|t| t.elapsed() >= ZPOOL_REFRESH);
+        if changed || (self.iostat.is_none() && retry) {
+            self.iostat = None;
+            self.iostat_started = Some(Instant::now());
+            match Iostat::spawn(names) {
+                Ok(i) => {
+                    self.iostat = Some(i);
+                    self.iostat_failure = None;
+                }
+                Err(e) => {
+                    let e = anyhow::Error::from(e).context("running zpool iostat");
+                    self.iostat_failure = Some((Availability::of(&e), format!("{e:#}")));
+                }
+            }
+        }
+        let (state, detail) = match &self.iostat {
+            None => match &self.iostat_failure {
+                Some((state, msg)) => (*state, Some(msg.clone())),
+                None => (Availability::Failed, None),
+            },
+            Some(i) => {
+                let latest = i.latest.lock().unwrap();
+                for p in pools.iter_mut() {
+                    p.iostat = latest.1.get(&p.name).cloned();
+                }
+                match latest.0 {
+                    Some(at) if at.elapsed() > 3 * IOSTAT_INTERVAL => (
+                        Availability::Stale,
+                        Some(format!("no zpool iostat report for {} s", at.elapsed().as_secs())),
+                    ),
+                    _ => (Availability::Ok, None),
+                }
+            }
+        };
+        self.report("zpool_iostat", state, detail, started.elapsed().as_secs_f64());
     }
 
     /// Adds `zpool status` (devices, errors, scrubs) to the pools: every
@@ -1445,6 +1504,125 @@ fn zpool_list() -> Result<Vec<ZPool>> {
     Ok(parse_zpool_list(&String::from_utf8_lossy(&out.stdout)))
 }
 
+/// Seconds per `zpool iostat` report; device latency and queues are averages
+/// over this.
+const IOSTAT_INTERVAL: Duration = Duration::from_secs(5);
+
+/// When `zpool iostat` last printed, and its newest lines per pool.
+type IostatLatest = Arc<std::sync::Mutex<(Option<Instant>, HashMap<String, Vec<VdevIo>>)>>;
+
+/// A `zpool iostat -Hpvlq` left running. It has no counters to difference,
+/// only averages since boot (its first report) or over each interval, so it
+/// keeps reporting and a thread keeps the latest numbers.
+struct Iostat {
+    child: std::process::Child,
+    pools: Vec<String>,
+    latest: IostatLatest,
+}
+
+impl Iostat {
+    fn spawn(pools: Vec<String>) -> io::Result<Iostat> {
+        use std::io::BufRead;
+        use std::process::{Command, Stdio};
+        let mut child = Command::new("zpool")
+            .args(["iostat", "-Hpvlq"])
+            .args(&pools)
+            .arg(IOSTAT_INTERVAL.as_secs().to_string())
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()?;
+        let out = child.stdout.take().unwrap();
+        let latest: IostatLatest = Arc::new(std::sync::Mutex::new((None, HashMap::new())));
+        let shared = latest.clone();
+        let mut reports = IostatReports::new(pools.clone());
+        let thread = std::thread::Builder::new().name("zpool-iostat".into()).spawn(move || {
+            for line in io::BufReader::new(out).lines() {
+                let Ok(line) = line else { break };
+                if let Some((pool, lines)) = reports.line(&line) {
+                    let mut l = shared.lock().unwrap();
+                    l.0 = Some(Instant::now());
+                    l.1.insert(pool.to_string(), lines.to_vec());
+                }
+            }
+        });
+        if let Err(e) = thread {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(e);
+        }
+        Ok(Iostat { child, pools, latest })
+    }
+}
+
+impl Drop for Iostat {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+/// Splits `zpool iostat -H` output for the given pools, in that order, into
+/// per-pool reports. Reports have no terminator: the next one starts again
+/// at the first pool, so a pool's lines are handed out as they arrive (they
+/// come all at once). The first report, averages since boot, is skipped.
+pub(crate) struct IostatReports {
+    pools: Vec<String>,
+    /// Index of the pool whose lines are arriving.
+    pool: Option<usize>,
+    reports: u64,
+    lines: Vec<VdevIo>,
+}
+
+impl IostatReports {
+    pub(crate) fn new(pools: Vec<String>) -> Self {
+        IostatReports { pools, pool: None, reports: 0, lines: Vec::new() }
+    }
+
+    /// Feeds one line; returns the pool's lines so far once past the first report.
+    pub(crate) fn line(&mut self, line: &str) -> Option<(&str, &[VdevIo])> {
+        let io = parse_iostat_line(line)?;
+        // A pool's own line can only come where the next pool is due.
+        let next = self.pool.map_or(0, |p| (p + 1) % self.pools.len().max(1));
+        if self.pools.get(next) == Some(&io.name) {
+            if next == 0 {
+                self.reports += 1;
+            }
+            self.pool = Some(next);
+            self.lines.clear();
+        }
+        let pool = self.pool?;
+        self.lines.push(io);
+        (self.reports > 1).then(|| (self.pools[pool].as_str(), self.lines.as_slice()))
+    }
+}
+
+/// One `zpool iostat -Hpvlq` line: name, alloc, free, operations, bandwidth,
+/// then total, disk, sync queue and async queue wait (read, write; ns),
+/// scrub, trim and rebuild wait, then pending and active per queue.
+pub(crate) fn parse_iostat_line(line: &str) -> Option<VdevIo> {
+    let f: Vec<&str> = line.split('\t').collect();
+    if f.len() < 32 {
+        return None;
+    }
+    let num = |i: usize| f[i].parse::<f64>().ok();
+    let wait = |i: usize| num(i).map(|ns| ns / 1e9);
+    let count = |i: usize| f[i].parse::<u64>().unwrap_or(0);
+    let names = ["sync_read", "sync_write", "async_read", "async_write", "scrub", "trim", "rebuild"];
+    Some(VdevIo {
+        name: f[0].to_string(),
+        read_ops: num(3)?,
+        write_ops: num(4)?,
+        read_bytes: num(5)?,
+        write_bytes: num(6)?,
+        read_wait: wait(7),
+        write_wait: wait(8),
+        read_disk_wait: wait(9),
+        write_disk_wait: wait(10),
+        queues: names.iter().enumerate().map(|(i, n)| (*n, count(18 + 2 * i), count(19 + 2 * i))).collect(),
+    })
+}
+
 /// `zpool status -j` (OpenZFS 2.3 and later): each pool's devices, errors and
 /// last scrub or resilver.
 fn zpool_status() -> Result<HashMap<String, PoolStatus>> {
@@ -1492,6 +1670,7 @@ fn pool_status(p: &serde_json::Value) -> PoolStatus {
         end_time: n("end_time"),
         to_examine: n("to_examine"),
         issued: n("issued"),
+        repaired: n("processed"),
         errors: n("errors"),
         pass_issued: n("issued_bytes_per_scan"),
         pass_start: n("pass_start"),
@@ -1509,7 +1688,7 @@ fn pool_status(p: &serde_json::Value) -> PoolStatus {
 fn push_vdev(v: &serde_json::Value, group: &'static str, depth: u8, out: &mut Vec<Vdev>) {
     let s = |k: &str| v[k].as_str().unwrap_or("").to_string();
     let n = |k: &str| v[k].as_u64().unwrap_or(0);
-    let note = v["aux"].as_str().map(str::to_string).or_else(|| v["was"].as_str().map(|w| format!("was {w}")));
+    let note = v["aux"].as_str().map(vdev_aux).or_else(|| v["was"].as_str().map(|w| format!("was {w}")));
     out.push(Vdev {
         name: s("name"),
         kind: s("vdev_type"),
@@ -1523,6 +1702,21 @@ fn push_vdev(v: &serde_json::Value, group: &'static str, depth: u8, out: &mut Ve
         note,
     });
     vdev_children(v, group, depth.saturating_add(1), out);
+}
+
+/// zpool status's wording for a vdev_aux_t code ("EXTERNAL" is a fault set
+/// with zpool offline -f, for one).
+fn vdev_aux(code: &str) -> String {
+    match code {
+        "OPEN_FAILED" => "cannot open".into(),
+        "CORRUPT_DATA" => "corrupted data".into(),
+        "NO_REPLICAS" => "insufficient replicas".into(),
+        "ERR_EXCEEDED" => "too many errors".into(),
+        "IO_FAILURE" => "experienced I/O failures".into(),
+        "EXTERNAL" | "EXTERNAL_PERSIST" => "external device fault".into(),
+        "SPARED" => "in use as a spare".into(),
+        other => other.to_lowercase().replace('_', " "),
+    }
 }
 
 fn vdev_children(v: &serde_json::Value, group: &'static str, depth: u8, out: &mut Vec<Vdev>) {
@@ -1883,38 +2077,73 @@ mod fixtures {
         assert_eq!((v.state.as_str(), v.errors(), v.slow_ios), ("ONLINE", 0, Some(0)));
     }
 
-    /// Written from OpenZFS 2.4.2's zpool_main.c JSON keys: a degraded
-    /// mirror, logs, cache, a spare and a scrub in progress.
+    /// A mirror of two files plus log, cache and spare, after a scrub that
+    /// repaired corruption injected into one side (zinject -e corrupt).
     #[test]
-    fn zpool_status_degraded_json() {
-        let pools = parse_zpool_status(&read("zpool-status-degraded.json")).unwrap();
-        let st = &pools["tank"];
-        assert_eq!(st.data_errors, 1);
-        assert!(st.message.as_deref().unwrap().starts_with("One or more devices are faulted in response to persistent errors. Sufficient"));
-        assert!(st.action.as_deref().unwrap().ends_with("mark the device repaired."));
+    fn zpool_status_after_repair() {
+        let pools = parse_zpool_status(&read("zpool-status-scrubbed.json")).unwrap();
+        let st = &pools["jmontest"];
+        assert_eq!(st.data_errors, 0);
+        assert!(st.message.as_deref().unwrap().starts_with("One or more devices has experienced an unrecoverable error. An attempt"));
         let layout: Vec<(&str, &str, u8)> = st.vdevs.iter().map(|v| (v.name.as_str(), v.group, v.depth)).collect();
         assert_eq!(
             layout,
             [
                 ("mirror-0", "", 0),
-                ("ada0p3", "", 1),
-                ("ada1p3", "", 1),
-                ("mirror-1", "", 0),
-                ("ada2p3", "", 1),
-                ("ada3p3", "", 1),
-                ("nda0p1", "logs", 0),
-                ("nda0p2", "cache", 0),
-                ("ada4p3", "spares", 0),
+                ("/tmp/jmontest-a.img", "", 1),
+                ("/tmp/jmontest-b.img", "", 1),
+                ("/tmp/jmontest-log.img", "logs", 0),
+                ("/tmp/jmontest-cache.img", "cache", 0),
+                ("/tmp/jmontest-spare.img", "spares", 0),
             ]
         );
-        let bad = &st.vdevs[2];
-        assert_eq!((bad.state.as_str(), bad.read_errors, bad.checksum_errors, bad.slow_ios), ("FAULTED", 2, 41, Some(12)));
-        assert_eq!(bad.note.as_deref(), Some("too many errors"));
-        assert!(!bad.healthy() && st.vdevs[8].healthy() && st.vdevs[0].slow_ios.is_none());
+        assert_eq!(st.vdevs[2].checksum_errors, 201);
+        assert!(st.vdevs[2].healthy() && st.vdevs[5].healthy() && st.vdevs[5].state == "AVAIL");
         let sc = st.scan.as_ref().unwrap();
-        assert_eq!((sc.function.as_str(), sc.state.as_str(), sc.errors, sc.paused), ("scrub", "scanning", 3, false));
-        assert_eq!(sc.progress(), 0.25);
-        assert_eq!(sc.rate(sc.pass_start as f64 + 1024.0), Some(1073741824.0));
+        assert_eq!((sc.function.as_str(), sc.state.as_str(), sc.errors, sc.repaired), ("scrub", "finished", 0, 24914944));
+        assert_eq!(sc.end_time, 1793602978);
+    }
+
+    /// The same pool with one side faulted (zpool offline -f) and a scrub
+    /// paused (zpool scrub -p).
+    #[test]
+    fn zpool_status_faulted() {
+        let pools = parse_zpool_status(&read("zpool-status-faulted.json")).unwrap();
+        let st = &pools["jmontest"];
+        let b = &st.vdevs[2];
+        assert_eq!((b.state.as_str(), b.note.as_deref()), ("FAULTED", Some("external device fault")));
+        assert!(!b.healthy());
+        let sc = st.scan.as_ref().unwrap();
+        assert_eq!((sc.state.as_str(), sc.paused), ("scanning", true));
+        assert!(sc.progress() > 0.99);
+    }
+
+    /// Three reports for two pools while one was being written to.
+    #[test]
+    fn zpool_iostat_reports() {
+        let text = String::from_utf8(read("zpool-iostat.txt")).unwrap();
+        let mut reports = IostatReports::new(vec!["jmontest".into(), "lpool".into()]);
+        let mut seen: Vec<(String, Vec<VdevIo>)> = Vec::new();
+        for line in text.lines() {
+            if let Some((pool, lines)) = reports.line(line) {
+                seen.push((pool.to_string(), lines.to_vec()));
+            }
+        }
+        // The first report (averages since boot) is skipped; the blank lines
+        // between device groups are not devices.
+        let full = |pool: &str, n: usize| seen.iter().find(|(p, l)| p == pool && l.len() == n).map(|(_, l)| l.clone());
+        let busy = full("jmontest", 6).expect("second report");
+        let names: Vec<&str> = busy.iter().map(|v| v.name.as_str()).collect();
+        assert_eq!(
+            names,
+            ["jmontest", "mirror-0", "/tmp/jmontest-a.img", "/tmp/jmontest-b.img", "/tmp/jmontest-log.img", "/tmp/jmontest-cache.img"]
+        );
+        assert_eq!((busy[0].read_ops, busy[0].write_ops), (0.0, 39943.0));
+        let a = &busy[2];
+        assert_eq!((a.read_wait, a.write_wait, a.write_disk_wait), (None, Some(52031e-9), Some(28469e-9)));
+        assert_eq!(a.queues.len(), 7);
+        assert_eq!(full("lpool", 2).unwrap()[1].name, "/usr/legion-pool.img");
+        assert!(seen.iter().all(|(_, l)| l[0].name != "jmontest" || l[0].write_ops != 48.0), "boot averages leaked");
     }
 
     #[test]

@@ -388,6 +388,39 @@ pub struct ZPool {
     /// Devices, errors and scrub or resilver state from `zpool status`;
     /// `None` when that could not be read (see the zpool_status collector).
     pub status: Option<PoolStatus>,
+    /// Per-device latency and queues from `zpool iostat`, pool totals first;
+    /// `None` until its first report (see the zpool_iostat collector).
+    pub iostat: Option<Vec<VdevIo>>,
+}
+
+/// One line of a `zpool iostat -vlq` report: averages over its interval.
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct VdevIo {
+    pub name: String,
+    /// Operations and bytes per second.
+    pub read_ops: f64,
+    pub write_ops: f64,
+    pub read_bytes: f64,
+    pub write_bytes: f64,
+    /// Mean seconds from queueing to completion, and the part spent on the
+    /// device; the rest was waiting in ZFS's queues. `None` without I/O.
+    pub read_wait: Option<f64>,
+    pub write_wait: Option<f64>,
+    pub read_disk_wait: Option<f64>,
+    pub write_disk_wait: Option<f64>,
+    /// ZFS I/O queues: (name, pending, active).
+    pub queues: Vec<(&'static str, u64, u64)>,
+}
+
+impl VdevIo {
+    /// I/Os waiting in ZFS's queues, and issued to the device.
+    pub fn pending(&self) -> u64 {
+        self.queues.iter().map(|q| q.1).sum()
+    }
+
+    pub fn active(&self) -> u64 {
+        self.queues.iter().map(|q| q.2).sum()
+    }
 }
 
 #[derive(Debug, Clone, Default, Serialize)]
@@ -415,6 +448,9 @@ pub struct PoolScan {
     pub end_time: u64,
     pub to_examine: u64,
     pub issued: u64,
+    /// Bytes rewritten from good copies.
+    pub repaired: u64,
+    /// Errors it could not repair.
     pub errors: u64,
     /// Bytes issued in this pass, when the pass started, and seconds it has
     /// spent paused, for the current rate.

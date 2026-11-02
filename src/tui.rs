@@ -1928,6 +1928,62 @@ fn zfs(s: &Sample) -> Vec<Line<'static>> {
         if let Some(st) = &p.status {
             lines.extend(pool_devices(p, st, s.snap.timestamp));
         }
+        if let Some(io) = &p.iostat {
+            lines.extend(pool_io(p, io));
+        }
+    }
+    lines
+}
+
+/// zpool iostat's last interval per device: rates, wait split into the
+/// device and ZFS's queues, and queue depth.
+fn pool_io(p: &crate::model::ZPool, io: &[crate::model::VdevIo]) -> Vec<Line<'static>> {
+    let depth = |name: &str| -> usize {
+        let st = p.status.as_ref();
+        st.and_then(|s| s.vdevs.iter().find(|v| v.name == name)).map_or(0, |v| 2 + 2 * v.depth as usize)
+    };
+    let nw = io.iter().map(|v| v.name.chars().count() + depth(&v.name)).max().unwrap_or(0).max(8) + 2;
+    let ms = |w: Option<f64>| w.map_or("-".to_string(), |w| format!("{:.1}", w * 1000.0));
+    let mut lines = vec![hdr(format!(
+        "  {:<nw$}{:>8}{:>8}{:>10}{:>10}{:>8}{:>8}{:>8}{:>8}{:>6}{:>6}",
+        format!("{} I/O", p.name),
+        "Rd/s",
+        "Wr/s",
+        "Rd-KB/s",
+        "Wr-KB/s",
+        "Rd-ms",
+        "(disk)",
+        "Wr-ms",
+        "(disk)",
+        "Pend",
+        "Act"
+    ))];
+    for v in io {
+        let wait = v.read_wait.unwrap_or(0.0).max(v.write_wait.unwrap_or(0.0)) * 1000.0;
+        let style = if wait >= 50.0 {
+            Style::default().fg(C_SYS)
+        } else if wait >= 20.0 {
+            Style::default().fg(C_WRITE)
+        } else {
+            Style::default()
+        };
+        let name = format!("{}{}", " ".repeat(depth(&v.name)), v.name);
+        lines.push(Line::styled(
+            format!(
+                "  {name:<nw$}{:>8.1}{:>8.1}{:>10.1}{:>10.1}{:>8}{:>8}{:>8}{:>8}{:>6}{:>6}",
+                v.read_ops,
+                v.write_ops,
+                v.read_bytes / 1024.0,
+                v.write_bytes / 1024.0,
+                ms(v.read_wait),
+                ms(v.read_disk_wait),
+                ms(v.write_wait),
+                ms(v.write_disk_wait),
+                v.pending(),
+                v.active()
+            ),
+            style,
+        ));
     }
     lines
 }
@@ -1964,12 +2020,13 @@ fn pool_devices(p: &crate::model::ZPool, st: &crate::model::PoolStatus, now: f64
         Some(sc) => {
             let t = if sc.end_time > 0 { sc.end_time } else { sc.start_time };
             let text = format!(
-                "{}: {} {} {} ({} ago), {} errors",
+                "{}: {} {} {} ({} ago), repaired {}, {} errors",
                 p.name,
                 sc.function,
                 sc.state,
                 when(t),
                 ago(now - t as f64),
+                human(sc.repaired),
                 sc.errors
             );
             if sc.errors > 0 { Line::styled(text, warn) } else { Line::raw(text) }
@@ -1979,7 +2036,8 @@ fn pool_devices(p: &crate::model::ZPool, st: &crate::model::PoolStatus, now: f64
     if st.vdevs.is_empty() {
         return lines;
     }
-    let nw = st.vdevs.iter().map(|v| v.name.chars().count() + 2 * v.depth as usize + 2).max().unwrap_or(0).max(8);
+    let indent = |v: &crate::model::Vdev| 2 * v.depth as usize + if v.group.is_empty() { 0 } else { 2 };
+    let nw = st.vdevs.iter().map(|v| indent(v) + v.name.chars().count()).max().unwrap_or(0).max(8) + 2;
     lines.push(hdr(format!("  {:<nw$}{:<10}{:>7}{:>7}{:>7}{:>7}", "Device", "State", "Read", "Write", "Cksum", "Slow")));
     let mut group = "";
     for v in &st.vdevs {
@@ -1987,8 +2045,7 @@ fn pool_devices(p: &crate::model::ZPool, st: &crate::model::PoolStatus, now: f64
             group = v.group;
             lines.push(dim(format!("  {group}")));
         }
-        let indent = 2 * v.depth as usize + if v.group.is_empty() { 0 } else { 2 };
-        let name = format!("{}{}", " ".repeat(indent), v.name);
+        let name = format!("{}{}", " ".repeat(indent(v)), v.name);
         let style = if !v.healthy() {
             bad
         } else if v.errors() > 0 || v.slow_ios.is_some_and(|n| n > 0) {
@@ -2184,16 +2241,39 @@ fn checks(s: &Sample) -> Vec<Line<'static>> {
             }
             for v in &st.vdevs {
                 if !v.healthy() {
-                    out.push((Level::Danger, format!("ZFS device {}/{} {}", p.name, v.name, v.state)));
+                    out.push((Level::Danger, format!("ZFS device {} ({}) {}", v.name, p.name, v.state)));
                 } else if v.errors() > 0 {
                     out.push((
                         Level::Warning,
                         format!(
-                            "ZFS device {}/{}: {} read, {} write, {} checksum errors",
-                            p.name, v.name, v.read_errors, v.write_errors, v.checksum_errors
+                            "ZFS device {} ({}): {} read, {} write, {} checksum errors",
+                            v.name, p.name, v.read_errors, v.write_errors, v.checksum_errors
                         ),
                     ));
                 }
+            }
+            // Leaf devices only: a mirror's or raidz's line averages its disks.
+            for io in p.iostat.iter().flatten() {
+                if !st.vdevs.iter().any(|v| v.name == io.name && v.slow_ios.is_some()) || io.read_ops + io.write_ops < 1.0 {
+                    continue;
+                }
+                let (total, disk) = if io.read_wait.unwrap_or(0.0) >= io.write_wait.unwrap_or(0.0) {
+                    (io.read_wait.unwrap_or(0.0), io.read_disk_wait.unwrap_or(0.0))
+                } else {
+                    (io.write_wait.unwrap_or(0.0), io.write_disk_wait.unwrap_or(0.0))
+                };
+                let (total, disk) = (total * 1000.0, disk * 1000.0);
+                out.push((
+                    level(total, 20.0, 50.0),
+                    format!(
+                        "ZFS device {} ({}) wait {:.1} ms: {:.1} on the device, {:.1} queued (warn 20, danger 50)",
+                        io.name,
+                        p.name,
+                        total,
+                        disk,
+                        (total - disk).max(0.0)
+                    ),
+                ));
             }
             if let Some(sc) = &st.scan {
                 if sc.state == "scanning" && sc.function == "resilver" {
@@ -2453,6 +2533,14 @@ mod render_tests {
         assert!(healthy.iter().any(|l| l.starts_with("zroot: scrub in progress") && l.contains("to go")), "{healthy:#?}");
         assert!(healthy.iter().any(|l| l.trim_start().starts_with("nda0p3") && l.contains("ONLINE")));
         assert!(healthy.iter().any(|l| l.trim() == "logs"));
+        s.snap.zfs.as_mut().unwrap().pools[0].status.as_mut().unwrap().vdevs[4].name = "/tmp/a-long-cache-device.img".into();
+        let rows = text(zfs(&s));
+        assert!(rows.iter().any(|l| l.contains("/tmp/a-long-cache-device.img  ONLINE")), "{rows:#?}");
+        assert!(healthy.iter().any(|l| l.trim_start().starts_with("zroot I/O") && l.ends_with("Pend   Act")));
+        let ada = healthy.iter().find(|l| l.trim_start().starts_with("ada0p3") && l.contains("12.6")).expect("ada0p3 I/O row");
+        assert!(ada.contains("24.0") && ada.contains("11.4"), "{ada}");
+        let checks0 = text(checks(&s));
+        assert!(checks0.iter().any(|l| l.starts_with("WARNING") && l.contains("ada0p3 (zroot) wait 24.0 ms: 11.4 on the device, 12.6 queued")), "{checks0:#?}");
 
         let st = s.snap.zfs.as_mut().unwrap().pools[0].status.as_mut().unwrap();
         st.vdevs[1].state = "FAULTED".into();
@@ -2466,11 +2554,11 @@ mod render_tests {
         sc.errors = 7;
         let lines = text(zfs(&s));
         assert!(lines.iter().any(|l| l.contains("FAULTED") && l.ends_with("too many errors")));
-        assert!(lines.iter().any(|l| l.starts_with("zroot: scrub finished") && l.contains("(1h 0m ago), 7 errors")));
+        assert!(lines.iter().any(|l| l.starts_with("zroot: scrub finished") && l.contains("(1h 0m ago), repaired 0B, 7 errors")));
         assert!(lines.iter().any(|l| l.contains("2 permanent errors")));
         let checks = text(checks(&s));
-        assert!(checks.iter().any(|l| l.starts_with("DANGER") && l.contains("ZFS device zroot/nda0p3 FAULTED")));
-        assert!(checks.iter().any(|l| l.starts_with("WARNING") && l.contains("zroot/ada0p3: 0 read, 0 write, 7 checksum")));
+        assert!(checks.iter().any(|l| l.starts_with("DANGER") && l.contains("ZFS device nda0p3 (zroot) FAULTED")));
+        assert!(checks.iter().any(|l| l.starts_with("WARNING") && l.contains("ada0p3 (zroot): 0 read, 0 write, 7 checksum")));
         assert!(checks.iter().any(|l| l.starts_with("DANGER") && l.contains("2 permanent data errors")));
     }
 
@@ -2613,8 +2701,9 @@ mod alignment_tests {
     }
 }
 
-/// Prints the detail screen for `JMON_DETAIL_PID` with live data, to check it
-/// by eye: `JMON_DETAIL_PID=1 cargo test show_detail -- --ignored --nocapture`.
+/// Prints the screen with live data to check it by eye: the detail screen for
+/// `JMON_DETAIL_PID`, or else the panels in `JMON_SHOW` (default "z"):
+/// `JMON_DETAIL_PID=1 cargo test show_live -- --ignored --nocapture`.
 #[cfg(test)]
 mod live_tests {
     use super::*;
@@ -2623,13 +2712,17 @@ mod live_tests {
 
     #[test]
     #[ignore]
-    fn show_detail() {
-        let pid: i32 = std::env::var("JMON_DETAIL_PID").expect("JMON_DETAIL_PID").parse().unwrap();
+    fn show_live() {
+        let pid: Option<i32> = std::env::var("JMON_DETAIL_PID").ok().map(|p| p.parse().unwrap());
+        let show = std::env::var("JMON_SHOW").unwrap_or_else(|_| "z".into());
+        let wait: u64 = std::env::var("JMON_WAIT").ok().map_or(1, |w| w.parse().unwrap());
         let mut c = Collector::new().unwrap();
         let first = c.collect();
-        let mut app = App::new(Hub::new(Duration::from_secs(1), 0), "t", vec![], LogRing::default());
-        app.open_detail(pid);
-        std::thread::sleep(Duration::from_secs(1));
+        let mut app = App::new(Hub::new(Duration::from_secs(1), 0), &show, vec![], LogRing::default());
+        if let Some(pid) = pid {
+            app.open_detail(pid);
+        }
+        std::thread::sleep(Duration::from_secs(wait));
         let s = Sample::derive(1, c.host(), Some(&first), c.collect());
         app.refresh_detail(1);
         let (w, h) = (130, 45);

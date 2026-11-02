@@ -78,7 +78,11 @@ filesystems
 ZFS ARC hit ratio and pool capacity, health and I/O; with OpenZFS 2.3
 or later also each pool's devices with their read, write and checksum
 errors and slow I/Os, permanent data errors, and the last or current
-scrub or resilver with its progress and rate
+scrub or resilver with its progress and rate.
+Per-device latency, split into time on the device and time queued in
+ZFS, and queue depths come from a
+.Nm zpool Cm iostat
+that jmon keeps running while pools are imported, averaged over 5 seconds
 .It Cm J
 jails and
 .Xr bhyve 8

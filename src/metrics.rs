@@ -159,6 +159,8 @@ catalog! {
     VdevHealth => "freebsd.zfs.vdev.health", "1", UpDown, "1 for each pool device, labelled with its state.";
     VdevErrors => "freebsd.zfs.vdev.errors", "{error}", Counter, "Read, write and checksum errors of each pool device since import or zpool clear.";
     VdevSlowIos => "freebsd.zfs.vdev.slow_ios", "{operation}", Counter, "I/Os slower than vfs.zfs.slow_io_ms on each leaf device.";
+    VdevWait => "freebsd.zfs.vdev.wait", "s", Gauge, "Mean time from queueing to completion (total) and on the device (disk) over zpool iostat's last interval.";
+    VdevQueue => "freebsd.zfs.vdev.queue", "{operation}", UpDown, "I/Os pending in and active from each ZFS I/O queue.";
     SelfCollect => "jmon.collection.duration", "s", Gauge, "Time jmon took to collect the last sample.";
     CollState => "jmon.collector.status", "1", UpDown, "1 for each collector, labelled with its state: ok, partial, stale, unsupported, denied or failed.";
     CollDuration => "jmon.collector.duration", "s", Gauge, "Time each collector took in the last sample.";
@@ -400,6 +402,30 @@ pub fn collect(s: &Sample, top_procs: usize, stats: &SelfStats) -> Families {
             b.add(M::PoolIo, vec![pool(), dir("write")], p.write_bytes as f64);
             b.add(M::PoolOps, vec![pool(), dir("read")], p.read_ops as f64);
             b.add(M::PoolOps, vec![pool(), dir("write")], p.write_ops as f64);
+            for io in p.iostat.iter().flatten() {
+                let dev = || vec![pool(), ("zfs.vdev.name", Val::from(io.name.clone()))];
+                for (dir, kind, w) in [
+                    ("read", "total", io.read_wait),
+                    ("write", "total", io.write_wait),
+                    ("read", "disk", io.read_disk_wait),
+                    ("write", "disk", io.write_disk_wait),
+                ] {
+                    if let Some(w) = w {
+                        let mut a = dev();
+                        a.push(("disk.io.direction", Val::from(dir)));
+                        a.push(("zfs.wait.type", Val::from(kind)));
+                        b.add(M::VdevWait, a, w);
+                    }
+                }
+                for (queue, pending, active) in &io.queues {
+                    for (state, n) in [("pending", pending), ("active", active)] {
+                        let mut a = dev();
+                        a.push(("zfs.queue", Val::from(*queue)));
+                        a.push(("zfs.queue.state", Val::from(state)));
+                        b.add(M::VdevQueue, a, *n as f64);
+                    }
+                }
+            }
             let Some(st) = &p.status else { continue };
             b.add(M::PoolDataErrors, vec![pool()], st.data_errors as f64);
             if let Some(sc) = &st.scan {

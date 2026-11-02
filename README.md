@@ -9,7 +9,7 @@ jmon is a performance monitor for FreeBSD modelled on [nmon](https://nmon.source
   - disks, including latency and queue depth
   - network and TCP
   - filesystems
-  - ZFS ARC and pools, with each pool's devices, their read/write/checksum errors and slow I/Os, and scrub or resilver progress (OpenZFS 2.3 or later)
+  - ZFS ARC and pools, with each pool's devices, their read/write/checksum errors and slow I/Os, and scrub or resilver progress (OpenZFS 2.3 or later), and per-device latency split into time on the device and time queued in ZFS, with queue depths
   - jails and bhyve VMs
   - temperatures, CPU clock and battery
   - top processes, with full command lines, I/O and a per-user filter
@@ -139,6 +139,9 @@ The service runs as `nobody` under daemon(8), which restarts it if it exits. `se
 | `freebsd.zfs.pool.{usage,fragmentation,health,io,operations}` | | `zfs.pool.name`, `zfs.pool.state` / `.health`, `disk.io.direction` |
 | `freebsd.zfs.pool.data_errors`, `freebsd.zfs.pool.scan.{progress,errors}` | {error}, 1, {error} | `zfs.pool.name`, `zfs.scan.function`, `zfs.scan.state` |
 | `freebsd.zfs.vdev.{health,errors,slow_ios}` | | `zfs.pool.name`, `zfs.vdev.{name,type,group,state}`, `error.type` |
+| `freebsd.zfs.vdev.wait`, `freebsd.zfs.vdev.queue` | s, {operation} | `zfs.pool.name`, `zfs.vdev.name`, `disk.io.direction`, `zfs.wait.type` (total, disk); `zfs.queue`, `zfs.queue.state` (pending, active) |
+
+Device latency and queues come from a `zpool iostat -Hpvlq <pools> 5` that jmon keeps running while pools are imported, so they are 5-second averages.
 | `process.{cpu.time,cpu.utilization,memory.usage,memory.virtual,disk.operations,paging.faults}` | | `process.pid`, `process.executable.name`, `process.owner`. Only emitted with `--export-top N` |
 | `jmon.collection.duration`, `jmon.otlp.exports`, `jmon.prometheus.scrapes` | | `result` |
 | `jmon.collector.{status,duration,last_success}` | 1, s, s | `jmon.collector`, `jmon.collector.state` |

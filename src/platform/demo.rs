@@ -376,6 +376,34 @@ impl Collector {
                     vdevs: vec![mirror.clone(), leaf("nda0p3", "", 1), leaf("ada0p3", "", 1), leaf("nda1p1", "logs", 0), leaf("da0", "cache", 0)],
                     ..Default::default()
                 }),
+                iostat: Some(
+                    [("zroot", 1.0), ("mirror-0", 1.0), ("nda0p3", 0.3), ("ada0p3", 0.7), ("nda1p1", 0.02), ("da0", 0.1)]
+                        .iter()
+                        .map(|&(name, share)| {
+                            let slow = if name == "ada0p3" { 6.0 } else { 1.0 };
+                            VdevIo {
+                                name: name.into(),
+                                read_ops: 900.0 * share,
+                                write_ops: 300.0 * share,
+                                read_bytes: 60e6 * share,
+                                write_bytes: 20e6 * share,
+                                read_wait: Some(0.0021 * slow),
+                                write_wait: Some(0.0040 * slow),
+                                read_disk_wait: Some(0.0015 * slow),
+                                write_disk_wait: Some(0.0019 * slow),
+                                queues: vec![
+                                    ("sync_read", 0, (2.0 * share) as u64),
+                                    ("sync_write", 0, 0),
+                                    ("async_read", 0, 0),
+                                    ("async_write", (8.0 * share) as u64, (4.0 * share) as u64),
+                                    ("scrub", (40.0 * share) as u64, (2.0 * share) as u64),
+                                    ("trim", 0, 0),
+                                    ("rebuild", 0, 0),
+                                ],
+                            }
+                        })
+                        .collect(),
+                ),
                 ..p.clone()
             })
             .collect()
@@ -403,6 +431,7 @@ const COLLECTORS: &[(&str, f64)] = &[
     ("arc", 0.03),
     ("zpool", 0.4),
     ("zpool_status", 0.05),
+    ("zpool_iostat", 0.01),
 ];
 
 /// Synthetic detail for the demo processes: a few threads whose counters
