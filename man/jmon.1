@@ -74,6 +74,13 @@ TCP segments, retransmits, listen-queue overflows, connection states
 NFS client and server operations, retries and timeouts
 .It Cm j
 filesystems
+.It Cm x
+kernel limits: open files, sockets, vnodes, processes and pipe memory
+against the sysctls that limit them, every limited UMA zone (mbufs,
+mbuf clusters, pf states and others) against its limit, and zones whose
+allocations failed or waited in the last interval.
+UMA's own caches fail by design and physical buffer pools fill in normal
+I/O; they are shown dimmed and not reported as problems
 .It Cm z
 ZFS ARC hit ratio and pool capacity, health and I/O; with OpenZFS 2.3
 or later also each pool's devices with their read, write and checksum

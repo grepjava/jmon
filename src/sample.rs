@@ -147,6 +147,14 @@ pub struct Rates {
     pub tcp: Option<TcpRates>,
     pub udp: Option<UdpRates>,
     pub zfs: Option<ZfsRates>,
+    /// Allocation failures and sleeps per second, aligned with `snap.zones`.
+    pub zones: Vec<ZoneRate>,
+}
+
+#[derive(Debug, Clone, Copy, Default, Serialize)]
+pub struct ZoneRate {
+    pub fails: f64,
+    pub sleeps: f64,
 }
 
 /// Resource use summed over a group of processes (a jail or a VM).
@@ -459,6 +467,28 @@ fn rates(prev: &Snapshot, cur: &Snapshot) -> Option<Rates> {
         _ => None,
     };
 
+    // Zone names repeat (one zone per memory domain), so pair the nth zone
+    // of a name with the nth of the same name.
+    let mut nth: HashMap<&str, usize> = HashMap::new();
+    let mut prev_zones: HashMap<(&str, usize), &UmaZone> = HashMap::new();
+    for z in &prev.zones {
+        let n = nth.entry(&z.name).or_default();
+        prev_zones.insert((&z.name, *n), z);
+        *n += 1;
+    }
+    let mut nth: HashMap<&str, usize> = HashMap::new();
+    let zones = cur
+        .zones
+        .iter()
+        .map(|z| {
+            let n = nth.entry(&z.name).or_default();
+            let p = prev_zones.get(&(z.name.as_str(), *n));
+            *n += 1;
+            p.map(|p| ZoneRate { fails: per_sec(z.fails, p.fails, secs), sleeps: per_sec(z.sleeps, p.sleeps, secs) })
+                .unwrap_or_default()
+        })
+        .collect();
+
     Some(Rates {
         interval: secs,
         cpu_total,
@@ -479,6 +509,7 @@ fn rates(prev: &Snapshot, cur: &Snapshot) -> Option<Rates> {
         tcp,
         udp,
         zfs,
+        zones,
     })
 }
 

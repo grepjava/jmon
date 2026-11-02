@@ -513,6 +513,9 @@ impl Collector {
         let sensors = self.run("sensors", Collector::sensors).unwrap_or_default();
         let jails = self.run("jails", |_| jails()).unwrap_or_default();
         let zfs = self.zfs();
+        let nprocs = processes.len();
+        let limits = self.run_partial("limits", |_| Ok(kernel_limits(nprocs))).unwrap_or_default();
+        let zones = self.run("uma", |_| zone_stats()).unwrap_or_default();
         Snapshot {
             taken,
             timestamp: unix_now(),
@@ -536,6 +539,8 @@ impl Collector {
             jails,
             zfs,
             nfs,
+            limits,
+            zones,
             collectors: std::mem::take(&mut self.status),
         }
     }
@@ -1166,6 +1171,81 @@ fn proc_args(pid: i32) -> Option<String> {
         .map(|a| String::from_utf8_lossy(a).into_owned())
         .collect();
     Some(args.join(" "))
+}
+
+// ---------------------------------------------------------------------------
+// Kernel limits
+
+/// (name, in-use sysctl, limit sysctl, counts bytes)
+const KERNEL_LIMITS: [(&str, &str, &str, bool); 4] = [
+    ("open files", "kern.openfiles", "kern.maxfiles", false),
+    ("sockets", "kern.ipc.numopensockets", "kern.ipc.maxsockets", false),
+    ("vnodes", "vfs.numvnodes", "kern.maxvnodes", false),
+    ("pipe KVA", "kern.ipc.pipekva", "kern.ipc.maxpipekva", true),
+];
+
+/// Kernel tables against their limits, and the sysctls that could not be read.
+fn kernel_limits(nprocs: usize) -> (Vec<KernelLimit>, Vec<&'static str>) {
+    let mut missing = Vec::new();
+    let mut out = Vec::new();
+    for (name, used, limit, bytes) in KERNEL_LIMITS {
+        match (sysctl_uint(used), sysctl_uint(limit)) {
+            (Ok(u), Ok(l)) => out.push(KernelLimit { name, sysctl: limit, used: u, limit: l, bytes }),
+            (u, _) => missing.push(if u.is_err() { used } else { limit }),
+        }
+    }
+    // The process list already counts them (less the idle process).
+    match sysctl_uint("kern.maxproc") {
+        Ok(l) if nprocs > 0 => {
+            out.push(KernelLimit { name: "processes", sysctl: "kern.maxproc", used: nprocs as u64 + 1, limit: l, bytes: false });
+        }
+        Ok(_) => {}
+        Err(_) => missing.push("kern.maxproc"),
+    }
+    (out, missing)
+}
+
+/// Every UMA zone in one read of vm.zone_stats, the stream vmstat -z uses.
+fn zone_stats() -> Result<Vec<UmaZone>> {
+    parse_zone_stats(&sysctl_raw("vm.zone_stats").context("vm.zone_stats")?)
+}
+
+/// `struct uma_stream_header`, then per zone a `struct uma_type_header` and
+/// one `struct uma_percpu_stat` per CPU (<vm/uma.h>, stream version 1).
+pub(crate) fn parse_zone_stats(buf: &[u8]) -> Result<Vec<UmaZone>> {
+    const HEADER: usize = 16;
+    const TYPE: usize = 120;
+    const PERCPU: usize = 64;
+    let u32_at = |b: &[u8], at: usize| b.get(at..at + 4).map(|x| u32::from_ne_bytes(x.try_into().unwrap()));
+    let u64_at = |b: &[u8], at: usize| u64::from_ne_bytes(b[at..at + 8].try_into().unwrap());
+    let (Some(version), Some(maxcpus), Some(count)) = (u32_at(buf, 0), u32_at(buf, 4), u32_at(buf, 8)) else {
+        bail!("vm.zone_stats: short header");
+    };
+    if version != 1 {
+        bail!("vm.zone_stats: stream version {version}, expected 1");
+    }
+    let stride = TYPE + maxcpus as usize * PERCPU;
+    (0..count as usize)
+        .map(|i| {
+            let at = HEADER + i * stride;
+            let rec = buf.get(at..at + stride).context("vm.zone_stats: short record")?;
+            // Per-CPU caches count their own allocations and frees.
+            let (mut allocs, mut frees) = (u64_at(rec, 72), u64_at(rec, 80));
+            for c in 0..maxcpus as usize {
+                allocs += u64_at(rec, TYPE + c * PERCPU);
+                frees += u64_at(rec, TYPE + c * PERCPU + 8);
+            }
+            Ok(UmaZone {
+                name: cstr_bytes(&rec[..32]),
+                size: u32_at(rec, 36).unwrap() as u64,
+                limit: u32_at(rec, 48).unwrap() as u64,
+                used: allocs.saturating_sub(frees),
+                requests: allocs,
+                fails: u64_at(rec, 88),
+                sleeps: u64_at(rec, 96),
+            })
+        })
+        .collect()
 }
 
 // ---------------------------------------------------------------------------
@@ -2144,6 +2224,31 @@ mod fixtures {
         assert_eq!(a.queues.len(), 7);
         assert_eq!(full("lpool", 2).unwrap()[1].name, "/usr/legion-pool.img");
         assert!(seen.iter().all(|(_, l)| l[0].name != "jmontest" || l[0].write_ops != 48.0), "boot averages leaked");
+    }
+
+    /// vm.zone_stats and vmstat -z --libxo json, read one after the other.
+    #[test]
+    fn zone_stats_match_vmstat() {
+        let zones = parse_zone_stats(&read("zone_stats.bin")).unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&read("vmstat-z.json")).unwrap();
+        let listed = json["vmstat"]["memory-zone-statistics"]["zone"].as_array().unwrap();
+        assert_eq!(zones.len(), listed.len());
+        let mut exact = 0;
+        for z in &zones {
+            // Names repeat per memory domain; compare the unique ones.
+            let same: Vec<_> = listed.iter().filter(|v| v["name"] == z.name.as_str()).collect();
+            if same.len() != 1 {
+                continue;
+            }
+            let v = same[0];
+            assert_eq!((v["size"].as_u64(), v["limit"].as_u64()), (Some(z.size), Some(z.limit)), "{}", z.name);
+            assert_eq!((v["fail"].as_u64(), v["sleep"].as_u64()), (Some(z.fails), Some(z.sleeps)), "{}", z.name);
+            exact += (v["requests"].as_u64() == Some(z.requests) && v["used"].as_u64() == Some(z.used)) as usize;
+        }
+        // Busy zones moved between the two reads.
+        assert!(exact * 10 >= zones.len() * 8, "{exact} of {}", zones.len());
+        let mbuf = zones.iter().find(|z| z.name == "mbuf_cluster").unwrap();
+        assert_eq!((mbuf.size, mbuf.limit), (2048, 125763));
     }
 
     #[test]

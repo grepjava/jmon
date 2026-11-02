@@ -39,6 +39,7 @@ enum Panel {
     Sensors,
     Jails,
     Zfs,
+    Limits,
     DiskGroups,
     DiskMap,
     Vm,
@@ -70,6 +71,7 @@ impl Panel {
             's' => Panel::Sensors,
             'J' => Panel::Jails,
             'z' => Panel::Zfs,
+            'x' => Panel::Limits,
             _ => return None,
         })
     }
@@ -97,6 +99,7 @@ impl Panel {
             Panel::Sensors => "Sensors",
             Panel::Jails => "Jails & bhyve VMs",
             Panel::Zfs => "ZFS",
+            Panel::Limits => "Kernel Limits",
         }
     }
 }
@@ -571,6 +574,7 @@ impl App {
                     Panel::Sensors => sensors(&s.snap, v.width, self.temp_peak),
                     Panel::Jails => jails(s, &v),
                     Panel::Zfs => zfs(s),
+                    Panel::Limits => kernel_limits(s),
                 };
                 (p, lines)
             })
@@ -902,6 +906,7 @@ const HELP_PANELS: &[(&str, &str)] = &[
     ("N", "NFS"),
     ("j", "Filesystems"),
     ("z", "ZFS (ARC, pools)"),
+    ("x", "Kernel limits & allocation failures"),
     ("J", "Jails & bhyve VMs"),
     ("t", "Top processes"),
     ("v", "Checks (warnings)"),
@@ -2075,6 +2080,89 @@ fn pool_devices(p: &crate::model::ZPool, st: &crate::model::PoolStatus, now: f64
     lines
 }
 
+/// How full a kernel table or limited UMA zone is.
+fn fill_style(used: f64) -> Style {
+    if used >= 0.95 {
+        Style::default().fg(C_SYS).add_modifier(Modifier::BOLD)
+    } else if used >= 0.8 {
+        Style::default().fg(C_WRITE)
+    } else {
+        Style::default()
+    }
+}
+
+/// Kernel tables and limited allocator zones against their limits, then
+/// allocations that failed in the last interval.
+fn kernel_limits(s: &Sample) -> Vec<Line<'static>> {
+    let snap = &s.snap;
+    let count = |n: u64, bytes: bool| if bytes { human(n) } else { n.to_string() };
+    // (name, used, limit, bytes, where the limit comes from, quiet)
+    let mut rows: Vec<(String, u64, u64, bool, String, bool)> = snap
+        .limits
+        .iter()
+        .map(|l| (l.name.to_string(), l.used, l.limit, l.bytes, l.sysctl.to_string(), false))
+        .collect();
+    rows.extend(
+        snap.zones
+            .iter()
+            .filter(|z| z.limit > 0)
+            .map(|z| (z.name.clone(), z.used, z.limit, false, "UMA zone".into(), z.routinely_full())),
+    );
+    let pct = |used: u64, limit: u64| if limit == 0 { 0.0 } else { used as f64 / limit as f64 };
+    // Fullest first, but pools that are routinely full after the rest.
+    rows.sort_by(|a, b| a.5.cmp(&b.5).then(pct(b.1, b.2).total_cmp(&pct(a.1, a.2))));
+    let mut lines = vec![hdr(format!("{:<20}{:>12}{:>13}{:>8}  {}", "Resource", "Used", "Limit", "Use%", "Limit set by"))];
+    let shown = rows.iter().filter(|r| pct(r.1, r.2) >= 0.01 || !r.4.starts_with("UMA")).count();
+    for (name, used, limit, bytes, by, quiet) in rows.iter().filter(|r| pct(r.1, r.2) >= 0.01 || !r.4.starts_with("UMA")) {
+        let p = pct(*used, *limit);
+        let style = if *quiet { DIM } else { fill_style(p) };
+        let note = if *quiet { "  (fills in normal I/O)" } else { "" };
+        lines.push(Line::styled(
+            format!("{:<20}{:>12}{:>13}{:>7.1}%  {by}{note}", clip(name, 19), count(*used, *bytes), count(*limit, *bytes), p * 100.0),
+            style,
+        ));
+    }
+    if rows.len() > shown {
+        lines.push(dim(format!("{} more limited zones under 1% full", rows.len() - shown)));
+    }
+
+    let Some(r) = &s.rates else { return lines };
+    let mut failing: Vec<(usize, f64, f64)> = r
+        .zones
+        .iter()
+        .enumerate()
+        .filter(|(_, z)| z.fails > 0.0 || z.sleeps > 0.0)
+        .map(|(i, z)| (i, z.fails, z.sleeps))
+        .collect();
+    failing.sort_by(|a, b| b.1.total_cmp(&a.1));
+    if failing.is_empty() {
+        let ever = snap.zones.iter().filter(|z| z.fails > 0).count();
+        lines.push(dim(format!(
+            "No allocation failures in the last interval ({ever} zones have failed since boot; UMA's caches fail by design)"
+        )));
+        return lines;
+    }
+    lines.push(hdr(format!("{:<20}{:>10}{:>10}{:>14}{:>22}", "Allocation failures", "Fails/s", "Sleeps/s", "Since boot", "Used / limit")));
+    for (i, fails, sleeps) in failing {
+        let z = &snap.zones[i];
+        let limit = if z.limit > 0 { format!("{} / {}", z.used, z.limit) } else { format!("{} / -", z.used) };
+        let (style, note) = if z.fails_by_design() {
+            (DIM, "  (cache: fails by design)")
+        } else if z.routinely_full() {
+            (DIM, "  (fills in normal I/O)")
+        } else if z.limit > 0 {
+            (Style::default().fg(C_SYS).add_modifier(Modifier::BOLD), "")
+        } else {
+            (Style::default().fg(C_WRITE), "")
+        };
+        lines.push(Line::styled(
+            format!("{:<20}{fails:>10.1}{sleeps:>10.1}{:>14}{limit:>22}{note}", clip(&z.name, 19), z.fails),
+            style,
+        ));
+    }
+    lines
+}
+
 fn nfs(s: &Sample) -> Vec<Line<'static>> {
     if s.snap.nfs.is_none() {
         return vec![dim("No NFS activity (no NFS mounts and nfsd is not running)")];
@@ -2284,6 +2372,33 @@ fn checks(s: &Sample) -> Vec<Line<'static>> {
             }
         }
     }
+    for l in &snap.limits {
+        let used = l.used as f64 / l.limit.max(1) as f64;
+        out.push((
+            level(used, 0.8, 0.95),
+            format!("Kernel {} {:.0}% of {} (warn 80, danger 95)", l.name, used * 100.0, l.sysctl),
+        ));
+    }
+    for (z, zr) in snap.zones.iter().zip(&r.zones) {
+        if z.limit == 0 || z.routinely_full() {
+            continue;
+        }
+        let used = z.used as f64 / z.limit as f64;
+        if zr.fails > 0.0 || zr.sleeps > 0.0 {
+            out.push((
+                Level::Danger,
+                format!(
+                    "Kernel zone {} at {:.0}% of its limit: {:.1} failed and {:.1} waiting allocations/s",
+                    z.name,
+                    used * 100.0,
+                    zr.fails,
+                    zr.sleeps
+                ),
+            ));
+        } else if used >= 0.5 {
+            out.push((level(used, 0.8, 0.95), format!("Kernel zone {} {:.0}% of its limit (warn 80, danger 95)", z.name, used * 100.0)));
+        }
+    }
     if let Some(n) = &r.nfs
         && (n.client_retries > 0.0 || n.client_timeouts > 0.0)
     {
@@ -2367,7 +2482,7 @@ mod tests {
             assert_eq!(s, first[..s.len()], "misaligned: {r}");
         }
         // Every panel key in Panel::from_key appears in the help.
-        for c in "hrcClmkdnTNjtsJzgoVLv".chars() {
+        for c in "hrcClmkdnTNjtsJzxgoVLv".chars() {
             assert!(HELP_PANELS.iter().any(|(k, _)| k.starts_with(c)) || c == '?', "missing {c}");
         }
     }
@@ -2563,6 +2678,31 @@ mod render_tests {
     }
 
     #[test]
+    fn kernel_limits_and_failing_zones() {
+        let mut s = demo_sample();
+        let text = |lines: Vec<Line>| -> Vec<String> {
+            lines.iter().map(|l| l.spans.iter().map(|s| s.content.as_ref()).collect()).collect()
+        };
+        // Squeeze mbuf clusters to their limit and make them fail.
+        let i = s.snap.zones.iter().position(|z| z.name == "mbuf_cluster").unwrap();
+        s.snap.zones[i].used = 125_000;
+        s.rates.as_mut().unwrap().zones[i].fails = 12.0;
+        let lines = text(kernel_limits(&s));
+        assert!(lines[1].starts_with("mbuf_cluster"), "fullest first: {lines:#?}");
+        let pbuf = lines.iter().position(|l| l.starts_with("clpbuf")).unwrap();
+        assert!(lines[pbuf].ends_with("(fills in normal I/O)") && lines[pbuf - 1].starts_with("sockets"), "{lines:#?}");
+        assert!(lines.iter().any(|l| l.starts_with("mbuf_cluster") && l.contains("99.4%") && l.ends_with("UMA zone")));
+        assert!(lines.iter().any(|l| l.starts_with("vnodes") && l.contains("80.3%") && l.ends_with("kern.maxvnodes")));
+        assert!(lines.iter().any(|l| l.starts_with("pipe KVA") && l.contains("128.0M")));
+        assert!(lines.iter().any(|l| l.starts_with("mbuf_cluster") && l.contains("12.0") && l.ends_with("125000 / 125763")));
+        let checks = text(checks(&s));
+        assert!(checks.iter().any(|l| l.starts_with("DANGER") && l.contains("Kernel zone mbuf_cluster at 99% of its limit: 12.0 failed")));
+        assert!(checks.iter().any(|l| l.starts_with("WARNING") && l.contains("Kernel vnodes 80% of kern.maxvnodes")));
+        // pbuf pools fill and fail in normal I/O: shown, never flagged.
+        assert!(!checks.iter().any(|l| l.contains("clpbuf")));
+    }
+
+    #[test]
     fn failed_collectors_are_flagged_not_shown_as_zero() {
         let mut s = demo_sample();
         let rq = s.snap.collectors.iter_mut().find(|c| c.name == "runq").unwrap();
@@ -2586,7 +2726,7 @@ mod render_tests {
             for (busy, args) in [(false, false), (true, true)] {
                 let mut app = App::new(
                     Hub::new(Duration::from_secs(2), 0),
-                    "rcClmkdgoGnTNjszJVLvt",
+                    "rcClmkdgoGnTNjszxJVLvt",
                     vec!["otlp http://x:4317".into()],
                     LogRing::default(),
                 );
@@ -2603,7 +2743,7 @@ mod render_tests {
                 // Scrolling stops at the last row and comes straight back.
                 app.key(KeyCode::End, KeyModifiers::NONE);
                 let max = app.scroll;
-                assert!(max < 200, "{w}x{h}: scroll {max}");
+                assert!(max < 300, "{w}x{h}: scroll {max}");
                 app.key(KeyCode::Down, KeyModifiers::NONE);
                 assert_eq!(app.scroll, max);
                 if max > 0 {
@@ -2638,7 +2778,7 @@ mod theme_tests {
         let first = c.collect();
         std::thread::sleep(Duration::from_millis(20));
         let s = Sample::derive(1, c.host(), Some(&first), c.collect());
-        let app = App::new(Hub::new(Duration::from_secs(2), 0), "rcClmkdgonTNjszJVLvt", vec![], LogRing::default());
+        let app = App::new(Hub::new(Duration::from_secs(2), 0), "rcClmkdgonTNjszxJVLvt", vec![], LogRing::default());
         let mut t = Terminal::new(TestBackend::new(170, 120)).unwrap();
         t.draw(|f| app.draw(f, Some(&s))).unwrap();
         let buf = t.backend().buffer();

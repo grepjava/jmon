@@ -239,9 +239,52 @@ pub struct Snapshot {
     pub zfs: Option<Zfs>,
     /// Present only while NFS is in use (an NFS mount or a running nfsd).
     pub nfs: Option<Nfs>,
+    /// Kernel tables with fixed limits: open files, sockets, vnodes, ...
+    pub limits: Vec<KernelLimit>,
+    /// The kernel's UMA allocator zones, as vmstat -z lists them.
+    pub zones: Vec<UmaZone>,
     /// How each collector fared this sample, so a zero or an empty list can be
     /// told apart from data that could not be read.
     pub collectors: Vec<CollectorStatus>,
+}
+
+/// A kernel table and its limit.
+#[derive(Debug, Clone, Serialize)]
+pub struct KernelLimit {
+    pub name: &'static str,
+    /// The sysctl that sets the limit.
+    pub sysctl: &'static str,
+    pub used: u64,
+    pub limit: u64,
+    /// Whether the numbers are bytes rather than items.
+    pub bytes: bool,
+}
+
+/// One UMA zone, the kernel allocator for one kind of object.
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct UmaZone {
+    pub name: String,
+    pub size: u64,
+    /// Most items it may hand out; 0 for no limit.
+    pub limit: u64,
+    pub used: u64,
+    /// Cumulative allocations, failed ones, and ones that slept at the limit.
+    pub requests: u64,
+    pub fails: u64,
+    pub sleeps: u64,
+}
+
+impl UmaZone {
+    /// UMA's own bucket and page caches fail non-blocking allocations by
+    /// design and fall back to slower paths.
+    pub fn fails_by_design(&self) -> bool {
+        self.name.ends_with(" Bucket") || self.name == "vm pgcache"
+    }
+
+    /// Physical buffer pools have small limits and fill up in ordinary I/O.
+    pub fn routinely_full(&self) -> bool {
+        self.name.ends_with("pbuf") || matches!(self.name.as_str(), "swrbuf" | "swwbuf")
+    }
 }
 
 /// Whether a collector's data in this snapshot can be trusted.
@@ -604,6 +647,8 @@ impl Snapshot {
             jails: vec![],
             zfs: None,
             nfs: None,
+            limits: vec![],
+            zones: vec![],
             collectors: vec![],
         }
     }

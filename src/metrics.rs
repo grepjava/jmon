@@ -161,6 +161,11 @@ catalog! {
     VdevSlowIos => "freebsd.zfs.vdev.slow_ios", "{operation}", Counter, "I/Os slower than vfs.zfs.slow_io_ms on each leaf device.";
     VdevWait => "freebsd.zfs.vdev.wait", "s", Gauge, "Mean time from queueing to completion (total) and on the device (disk) over zpool iostat's last interval.";
     VdevQueue => "freebsd.zfs.vdev.queue", "{operation}", UpDown, "I/Os pending in and active from each ZFS I/O queue.";
+    KernelUtilization => "freebsd.kernel.limit.utilization", "1", Gauge, "Fraction of a kernel table or limited UMA zone in use.";
+    UmaUsage => "freebsd.kernel.uma.usage", "{item}", UpDown, "Items in use in each limited UMA zone.";
+    UmaLimit => "freebsd.kernel.uma.limit", "{item}", UpDown, "Most items each limited UMA zone may hand out.";
+    UmaFailures => "freebsd.kernel.uma.failures", "{allocation}", Counter, "Failed allocations per UMA zone, for zones that have failed.";
+    UmaSleeps => "freebsd.kernel.uma.sleeps", "{allocation}", Counter, "Allocations that waited at a UMA zone's limit, for zones where any did.";
     SelfCollect => "jmon.collection.duration", "s", Gauge, "Time jmon took to collect the last sample.";
     CollState => "jmon.collector.status", "1", UpDown, "1 for each collector, labelled with its state: ok, partial, stale, unsupported, denied or failed.";
     CollDuration => "jmon.collector.duration", "s", Gauge, "Time each collector took in the last sample.";
@@ -453,6 +458,36 @@ pub fn collect(s: &Sample, top_procs: usize, stats: &SelfStats) -> Families {
         }
     }
 
+    for l in &snap.limits {
+        b.add(M::KernelUtilization, vec![("freebsd.kernel.resource", Val::from(l.name))], l.used as f64 / l.limit.max(1) as f64);
+    }
+    // Zone names repeat per memory domain; one series per name.
+    let mut zones: Vec<(&str, crate::model::UmaZone)> = Vec::new();
+    for z in &snap.zones {
+        match zones.iter_mut().find(|(n, _)| *n == z.name) {
+            Some((_, t)) => {
+                t.used += z.used;
+                t.limit += z.limit;
+                t.fails += z.fails;
+                t.sleeps += z.sleeps;
+            }
+            None => zones.push((&z.name, z.clone())),
+        }
+    }
+    for (name, z) in &zones {
+        let zone = || vec![("freebsd.uma.zone", Val::from(name.to_string()))];
+        if z.limit > 0 {
+            b.add(M::KernelUtilization, vec![("freebsd.kernel.resource", Val::from(format!("uma:{name}")))], z.used as f64 / z.limit as f64);
+            b.add(M::UmaUsage, zone(), z.used as f64);
+            b.add(M::UmaLimit, zone(), z.limit as f64);
+        }
+        if z.fails > 0 {
+            b.add(M::UmaFailures, zone(), z.fails as f64);
+        }
+        if z.sleeps > 0 {
+            b.add(M::UmaSleeps, zone(), z.sleeps as f64);
+        }
+    }
     b.add(M::SelfCollect, vec![], s.collect_secs);
     for c in &snap.collectors {
         let name = || ("jmon.collector", Val::from(c.name));

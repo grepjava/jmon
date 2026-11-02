@@ -328,6 +328,14 @@ impl Collector {
             ],
             zfs: Some(Zfs { arc_size: arc, arc_target: arc + GIB / 2, pools: self.pools(now_wall), ..self.zfs.clone() }),
             nfs: Some(self.nfs.clone()),
+            limits: vec![
+                KernelLimit { name: "open files", sysctl: "kern.maxfiles", used: 4_210, limit: 524_288, bytes: false },
+                KernelLimit { name: "sockets", sysctl: "kern.ipc.maxsockets", used: 1_830, limit: 524_288, bytes: false },
+                KernelLimit { name: "vnodes", sysctl: "kern.maxvnodes", used: 210_400, limit: 262_144, bytes: false },
+                KernelLimit { name: "pipe KVA", sysctl: "kern.ipc.maxpipekva", used: 1 << 20, limit: 128 << 20, bytes: true },
+                KernelLimit { name: "processes", sysctl: "kern.maxproc", used: 212, limit: 16_420, bytes: false },
+            ],
+            zones: self.zones(t),
             collectors: COLLECTORS
                 .iter()
                 .map(|&(name, ms)| CollectorStatus {
@@ -343,6 +351,32 @@ impl Collector {
 }
 
 impl Collector {
+    /// A few UMA zones; mbuf clusters run low and start failing now and then.
+    fn zones(&self, t: f64) -> Vec<UmaZone> {
+        let z = |name: &str, size, limit, used, fails| UmaZone {
+            name: name.into(),
+            size,
+            limit,
+            used,
+            requests: (t * 900.0) as u64 + used,
+            fails,
+            sleeps: 0,
+        };
+        let squeeze = (t / 40.0).sin().max(0.0);
+        let clusters = 100_000 + (25_000.0 * squeeze) as u64;
+        let fails = if squeeze > 0.9 { (t * 3.0) as u64 } else { 0 };
+        vec![
+            z("mbuf", 256, 804_884, 18_200, 0),
+            z("mbuf_cluster", 2048, 125_763, clusters.min(125_763), fails),
+            z("mbuf_jumbo_page", 4096, 62_881, 640, 0),
+            z("socket", 1024, 524_288, 1_830, 0),
+            z("pf states", 312, 100_000, 41_200, 0),
+            z("clpbuf", 512, 32, 32, (t * 2.0) as u64),
+            z("64 Bucket", 512, 0, 562, 4_160),
+            z("vm pgcache", 4096, 0, 257_400, 1_358),
+        ]
+    }
+
     /// The demo pool: a mirror plus a log and a cache device, mid-scrub.
     fn pools(&self, now: f64) -> Vec<ZPool> {
         let leaf = |name: &str, group: &'static str, depth: u8| Vdev {
@@ -432,6 +466,8 @@ const COLLECTORS: &[(&str, f64)] = &[
     ("zpool", 0.4),
     ("zpool_status", 0.05),
     ("zpool_iostat", 0.01),
+    ("limits", 0.01),
+    ("uma", 0.4),
 ];
 
 /// Synthetic detail for the demo processes: a few threads whose counters
