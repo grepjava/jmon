@@ -24,7 +24,9 @@ opentelemetry_sdk = { version = "0.33.1", default-features = false, features = [
 ratatui = "0.30.2"
 reqwest = { version = "0.13", default-features = false, features = ["blocking", "rustls"], optional = true }
 serde = { version = "1.0.229", features = ["derive", "rc"] }
-serde_json = "1.0.154"
+# preserve_order keeps zpool status devices in pool order (indexmap is
+# already a dependency).
+serde_json = { version = "1.0.154", features = ["preserve_order"] }
 tokio = { version = "1.54.1", features = ["rt-multi-thread", "macros", "signal", "time", "net", "io-util", "sync"] }
 toml = "1"
 tracing = "0.1.44"

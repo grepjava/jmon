@@ -153,6 +153,12 @@ catalog! {
     PoolHealth => "freebsd.zfs.pool.health", "1", UpDown, "1 for each pool, labelled with its health state.";
     PoolIo => "freebsd.zfs.pool.io", "By", Counter, "Logical bytes read and written per pool.";
     PoolOps => "freebsd.zfs.pool.operations", "{operation}", Counter, "Logical read and write operations per pool.";
+    PoolDataErrors => "freebsd.zfs.pool.data_errors", "{error}", UpDown, "Permanent errors: data ZFS could not repair.";
+    PoolScanProgress => "freebsd.zfs.pool.scan.progress", "1", Gauge, "Fraction done of the current or last scrub or resilver.";
+    PoolScanErrors => "freebsd.zfs.pool.scan.errors", "{error}", UpDown, "Errors found by the current or last scrub or resilver.";
+    VdevHealth => "freebsd.zfs.vdev.health", "1", UpDown, "1 for each pool device, labelled with its state.";
+    VdevErrors => "freebsd.zfs.vdev.errors", "{error}", Counter, "Read, write and checksum errors of each pool device since import or zpool clear.";
+    VdevSlowIos => "freebsd.zfs.vdev.slow_ios", "{operation}", Counter, "I/Os slower than vfs.zfs.slow_io_ms on each leaf device.";
     SelfCollect => "jmon.collection.duration", "s", Gauge, "Time jmon took to collect the last sample.";
     CollState => "jmon.collector.status", "1", UpDown, "1 for each collector, labelled with its state: ok, partial, stale, unsupported, denied or failed.";
     CollDuration => "jmon.collector.duration", "s", Gauge, "Time each collector took in the last sample.";
@@ -394,6 +400,30 @@ pub fn collect(s: &Sample, top_procs: usize, stats: &SelfStats) -> Families {
             b.add(M::PoolIo, vec![pool(), dir("write")], p.write_bytes as f64);
             b.add(M::PoolOps, vec![pool(), dir("read")], p.read_ops as f64);
             b.add(M::PoolOps, vec![pool(), dir("write")], p.write_ops as f64);
+            let Some(st) = &p.status else { continue };
+            b.add(M::PoolDataErrors, vec![pool()], st.data_errors as f64);
+            if let Some(sc) = &st.scan {
+                let attrs = || vec![pool(), ("zfs.scan.function", Val::from(sc.function.clone())), ("zfs.scan.state", Val::from(sc.state.clone()))];
+                b.add(M::PoolScanProgress, attrs(), sc.progress());
+                b.add(M::PoolScanErrors, attrs(), sc.errors as f64);
+            }
+            for v in &st.vdevs {
+                let dev = || {
+                    let group = if v.group.is_empty() { "normal" } else { v.group };
+                    vec![pool(), ("zfs.vdev.name", Val::from(v.name.clone())), ("zfs.vdev.type", Val::from(v.kind.clone())), ("zfs.vdev.group", Val::from(group))]
+                };
+                let mut a = dev();
+                a.push(("zfs.vdev.state", Val::from(v.state.clone())));
+                b.add(M::VdevHealth, a, 1.0);
+                for (kind, n) in [("read", v.read_errors), ("write", v.write_errors), ("checksum", v.checksum_errors)] {
+                    let mut a = dev();
+                    a.push(("error.type", Val::from(kind)));
+                    b.add(M::VdevErrors, a, n as f64);
+                }
+                if let Some(n) = v.slow_ios {
+                    b.add(M::VdevSlowIos, dev(), n as f64);
+                }
+            }
         }
     }
 

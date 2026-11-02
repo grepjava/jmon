@@ -75,7 +75,10 @@ NFS client and server operations, retries and timeouts
 .It Cm j
 filesystems
 .It Cm z
-ZFS ARC hit ratio and pool capacity, health and I/O
+ZFS ARC hit ratio and pool capacity, health and I/O; with OpenZFS 2.3
+or later also each pool's devices with their read, write and checksum
+errors and slow I/Os, permanent data errors, and the last or current
+scrub or resilver with its progress and rate
 .It Cm J
 jails and
 .Xr bhyve 8

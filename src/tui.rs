@@ -1924,6 +1924,97 @@ fn zfs(s: &Sample) -> Vec<Line<'static>> {
             )),
         ]));
     }
+    for p in &z.pools {
+        if let Some(st) = &p.status {
+            lines.extend(pool_devices(p, st, s.snap.timestamp));
+        }
+    }
+    lines
+}
+
+/// One pool's last scrub or resilver, devices and problems, like zpool status.
+fn pool_devices(p: &crate::model::ZPool, st: &crate::model::PoolStatus, now: f64) -> Vec<Line<'static>> {
+    let bad = Style::default().fg(C_SYS).add_modifier(Modifier::BOLD);
+    let warn = Style::default().fg(C_WRITE);
+    let mut lines = Vec::new();
+    let when = |t: u64| {
+        chrono::DateTime::from_timestamp(t as i64, 0)
+            .map(|d| d.with_timezone(&chrono::Local).format("%Y-%m-%d %H:%M").to_string())
+            .unwrap_or_default()
+    };
+    let scan = match &st.scan {
+        None => dim(format!("{}: never scrubbed", p.name)),
+        Some(sc) if sc.state == "scanning" => {
+            let mut text = format!(
+                "{}: {} {} {:.1}% ({} of {})",
+                p.name,
+                sc.function,
+                if sc.paused { "paused at" } else { "in progress" },
+                sc.progress() * 100.0,
+                human(sc.issued),
+                human(sc.to_examine)
+            );
+            if let Some(rate) = sc.rate(now).filter(|r| *r > 0.0 && !sc.paused) {
+                let left = sc.to_examine.saturating_sub(sc.issued) as f64 / rate;
+                text.push_str(&format!(" at {}/s, {} to go", human(rate as u64), ago(left)));
+            }
+            text.push_str(&format!(", {} errors", sc.errors));
+            Line::styled(text, if sc.function == "resilver" || sc.errors > 0 { warn } else { Style::default() })
+        }
+        Some(sc) => {
+            let t = if sc.end_time > 0 { sc.end_time } else { sc.start_time };
+            let text = format!(
+                "{}: {} {} {} ({} ago), {} errors",
+                p.name,
+                sc.function,
+                sc.state,
+                when(t),
+                ago(now - t as f64),
+                sc.errors
+            );
+            if sc.errors > 0 { Line::styled(text, warn) } else { Line::raw(text) }
+        }
+    };
+    lines.push(scan);
+    if st.vdevs.is_empty() {
+        return lines;
+    }
+    let nw = st.vdevs.iter().map(|v| v.name.chars().count() + 2 * v.depth as usize + 2).max().unwrap_or(0).max(8);
+    lines.push(hdr(format!("  {:<nw$}{:<10}{:>7}{:>7}{:>7}{:>7}", "Device", "State", "Read", "Write", "Cksum", "Slow")));
+    let mut group = "";
+    for v in &st.vdevs {
+        if v.group != group {
+            group = v.group;
+            lines.push(dim(format!("  {group}")));
+        }
+        let indent = 2 * v.depth as usize + if v.group.is_empty() { 0 } else { 2 };
+        let name = format!("{}{}", " ".repeat(indent), v.name);
+        let style = if !v.healthy() {
+            bad
+        } else if v.errors() > 0 || v.slow_ios.is_some_and(|n| n > 0) {
+            warn
+        } else {
+            Style::default()
+        };
+        let slow = v.slow_ios.map_or(String::new(), |n| n.to_string());
+        let note = v.note.as_ref().map(|n| format!("  {n}")).unwrap_or_default();
+        lines.push(Line::styled(
+            format!(
+                "  {name:<nw$}{:<10}{:>7}{:>7}{:>7}{slow:>7}{note}",
+                v.state, v.read_errors, v.write_errors, v.checksum_errors
+            ),
+            style,
+        ));
+    }
+    if st.data_errors > 0 {
+        lines.push(Line::styled(format!("  {} permanent errors: data ZFS could not repair (zpool status -v)", st.data_errors), bad));
+    }
+    if let Some(m) = &st.message {
+        lines.push(Line::styled(format!("  {m}"), warn));
+    }
+    if let Some(a) = &st.action {
+        lines.push(Line::styled(format!("  Action: {a}"), warn));
+    }
     lines
 }
 
@@ -2086,6 +2177,30 @@ fn checks(s: &Sample) -> Vec<Line<'static>> {
             if p.size > 0 {
                 let cap = p.allocated as f64 / p.size as f64;
                 out.push((level(cap, 0.8, 0.9), format!("ZFS pool {} {:.0}% allocated (warn 80, danger 90)", p.name, cap * 100.0)));
+            }
+            let Some(st) = &p.status else { continue };
+            if st.data_errors > 0 {
+                out.push((Level::Danger, format!("ZFS pool {} has {} permanent data errors", p.name, st.data_errors)));
+            }
+            for v in &st.vdevs {
+                if !v.healthy() {
+                    out.push((Level::Danger, format!("ZFS device {}/{} {}", p.name, v.name, v.state)));
+                } else if v.errors() > 0 {
+                    out.push((
+                        Level::Warning,
+                        format!(
+                            "ZFS device {}/{}: {} read, {} write, {} checksum errors",
+                            p.name, v.name, v.read_errors, v.write_errors, v.checksum_errors
+                        ),
+                    ));
+                }
+            }
+            if let Some(sc) = &st.scan {
+                if sc.state == "scanning" && sc.function == "resilver" {
+                    out.push((Level::Warning, format!("ZFS pool {} resilvering, {:.1}% done", p.name, sc.progress() * 100.0)));
+                } else if sc.errors > 0 {
+                    out.push((Level::Warning, format!("ZFS pool {} {} found {} errors", p.name, sc.function, sc.errors)));
+                }
             }
         }
     }
@@ -2326,6 +2441,37 @@ mod render_tests {
         app.open_detail(999_999);
         let lines = text(detail(&s, app.detail.as_ref().unwrap(), 118));
         assert!(lines[0].contains("PID 999999 is not running"));
+    }
+
+    #[test]
+    fn zfs_devices_and_problems() {
+        let mut s = demo_sample();
+        let text = |lines: Vec<Line>| -> Vec<String> {
+            lines.iter().map(|l| l.spans.iter().map(|s| s.content.as_ref()).collect()).collect()
+        };
+        let healthy = text(zfs(&s));
+        assert!(healthy.iter().any(|l| l.starts_with("zroot: scrub in progress") && l.contains("to go")), "{healthy:#?}");
+        assert!(healthy.iter().any(|l| l.trim_start().starts_with("nda0p3") && l.contains("ONLINE")));
+        assert!(healthy.iter().any(|l| l.trim() == "logs"));
+
+        let st = s.snap.zfs.as_mut().unwrap().pools[0].status.as_mut().unwrap();
+        st.vdevs[1].state = "FAULTED".into();
+        st.vdevs[1].note = Some("too many errors".into());
+        st.vdevs[2].checksum_errors = 7;
+        st.data_errors = 2;
+        st.message = Some("One or more devices are faulted.".into());
+        let sc = st.scan.as_mut().unwrap();
+        sc.state = "finished".into();
+        sc.end_time = s.snap.timestamp as u64 - 3600;
+        sc.errors = 7;
+        let lines = text(zfs(&s));
+        assert!(lines.iter().any(|l| l.contains("FAULTED") && l.ends_with("too many errors")));
+        assert!(lines.iter().any(|l| l.starts_with("zroot: scrub finished") && l.contains("(1h 0m ago), 7 errors")));
+        assert!(lines.iter().any(|l| l.contains("2 permanent errors")));
+        let checks = text(checks(&s));
+        assert!(checks.iter().any(|l| l.starts_with("DANGER") && l.contains("ZFS device zroot/nda0p3 FAULTED")));
+        assert!(checks.iter().any(|l| l.starts_with("WARNING") && l.contains("zroot/ada0p3: 0 read, 0 write, 7 checksum")));
+        assert!(checks.iter().any(|l| l.starts_with("DANGER") && l.contains("2 permanent data errors")));
     }
 
     #[test]

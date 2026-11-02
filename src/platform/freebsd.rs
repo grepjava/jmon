@@ -269,6 +269,8 @@ pub struct Collector {
     args: HashMap<i32, (i64, String)>,
     /// `zpool list` is a fork+exec, so pool capacity is refreshed slowly.
     zpools: Option<ZpoolCache>,
+    /// `zpool status`, refreshed like `zpool list` but faster during a scan.
+    zpool_status: Option<StatusCache>,
     /// Cached `vfs.nfs.nfsstats` bytes + parsed Nfs so idle NFS mounts do not spawn `nfsstat`.
     nfs_cache: Option<(Vec<u8>, Nfs)>,
     /// Battery sysctls run ACPI methods (~4 ms each), so read them rarely.
@@ -423,6 +425,13 @@ const ZPOOL_REFRESH_BUSY: Duration = Duration::from_secs(5);
 const BATTERY_REFRESH: Duration = Duration::from_secs(30);
 const SENSOR_LOOKUP: Duration = Duration::from_secs(60);
 
+struct StatusCache {
+    at: Instant,
+    pools: HashMap<String, PoolStatus>,
+    /// Why the last refresh failed; `pools` then holds the last good read.
+    failure: Option<(Availability, String)>,
+}
+
 struct ZpoolCache {
     at: Instant,
     pools: Vec<ZPool>,
@@ -460,6 +469,7 @@ impl Collector {
             users: HashMap::new(),
             args: HashMap::new(),
             zpools: None,
+            zpool_status: None,
             nfs_cache: None,
             battery: None,
             sensor_lookup: Instant::now(),
@@ -646,7 +656,49 @@ impl Collector {
             Some((state, msg)) => (*state, Some(msg.clone())),
         };
         self.report("zpool", state, detail, started.elapsed().as_secs_f64());
+        if !pools.is_empty() {
+            self.attach_status(&mut pools);
+        }
         pools
+    }
+
+    /// Adds `zpool status` (devices, errors, scrubs) to the pools: every
+    /// ZPOOL_REFRESH, or every ZPOOL_REFRESH_BUSY while a scan is running.
+    fn attach_status(&mut self, pools: &mut [ZPool]) {
+        let started = Instant::now();
+        let due = match &self.zpool_status {
+            None => true,
+            Some(c) => {
+                let scanning = c.pools.values().any(|s| s.scan.as_ref().is_some_and(|s| s.state == "scanning"));
+                c.at.elapsed() >= if scanning { ZPOOL_REFRESH_BUSY } else { ZPOOL_REFRESH }
+            }
+        };
+        if due {
+            let read = zpool_status();
+            let c = self.zpool_status.get_or_insert_with(|| StatusCache {
+                at: Instant::now(),
+                pools: HashMap::new(),
+                failure: None,
+            });
+            c.at = Instant::now();
+            match read {
+                Ok(p) => {
+                    c.pools = p;
+                    c.failure = None;
+                }
+                Err(e) => c.failure = Some((Availability::of(&e), format!("{e:#}"))),
+            }
+        }
+        let c = self.zpool_status.as_ref().unwrap();
+        for p in pools.iter_mut() {
+            p.status = c.pools.get(&p.name).cloned();
+        }
+        let (state, detail) = match &c.failure {
+            None => (Availability::Ok, None),
+            Some((_, msg)) if !c.pools.is_empty() => (Availability::Stale, Some(msg.clone())),
+            Some((state, msg)) => (*state, Some(msg.clone())),
+        };
+        self.report("zpool_status", state, detail, started.elapsed().as_secs_f64());
     }
 
     fn run<T>(&mut self, name: &'static str, f: impl FnOnce(&mut Self) -> Result<T>) -> Option<T> {
@@ -1393,6 +1445,92 @@ fn zpool_list() -> Result<Vec<ZPool>> {
     Ok(parse_zpool_list(&String::from_utf8_lossy(&out.stdout)))
 }
 
+/// `zpool status -j` (OpenZFS 2.3 and later): each pool's devices, errors and
+/// last scrub or resilver.
+fn zpool_status() -> Result<HashMap<String, PoolStatus>> {
+    let out = std::process::Command::new("zpool")
+        .args(["status", "-j", "--json-int"])
+        .output()
+        .context("running zpool")?;
+    if !out.status.success() {
+        let err = String::from_utf8_lossy(&out.stderr);
+        if err.contains("invalid option") {
+            let e = io::Error::new(io::ErrorKind::Unsupported, "zpool status -j needs OpenZFS 2.3 or later");
+            return Err(e.into());
+        }
+        bail!("zpool status exited with {}: {}", out.status, err.lines().next().unwrap_or("").trim());
+    }
+    parse_zpool_status(&out.stdout)
+}
+
+pub(crate) fn parse_zpool_status(json: &[u8]) -> Result<HashMap<String, PoolStatus>> {
+    let v: serde_json::Value = serde_json::from_slice(json).context("parsing zpool status")?;
+    let pools = v["pools"].as_object().context("zpool status: no pools")?;
+    Ok(pools.iter().map(|(name, p)| (name.clone(), pool_status(p))).collect())
+}
+
+fn pool_status(p: &serde_json::Value) -> PoolStatus {
+    // The messages are wrapped with newlines and tabs for a terminal.
+    let text = |k: &str| p[k].as_str().map(|s| s.split_whitespace().collect::<Vec<_>>().join(" "));
+    let mut vdevs = Vec::new();
+    // The root vdev, named after the pool, holds the main devices.
+    if let Some(root) = p["vdevs"].as_object().and_then(|m| m.values().next()) {
+        vdev_children(root, "", 0, &mut vdevs);
+    }
+    for (key, group) in [("special", "special"), ("dedup", "dedup"), ("logs", "logs"), ("l2cache", "cache"), ("spares", "spares")] {
+        for v in p[key].as_object().into_iter().flat_map(|m| m.values()) {
+            push_vdev(v, group, 0, &mut vdevs);
+        }
+    }
+    let s = &p["scan_stats"];
+    let n = |k: &str| s[k].as_u64().unwrap_or(0);
+    let scan = s["function"].as_str().filter(|f| *f != "NONE").map(|f| PoolScan {
+        function: if f == "ERRORSCRUB" { "error scrub".into() } else { f.to_lowercase() },
+        state: s["state"].as_str().unwrap_or("").to_lowercase(),
+        paused: n("scrub_pause") != 0,
+        start_time: n("start_time"),
+        end_time: n("end_time"),
+        to_examine: n("to_examine"),
+        issued: n("issued"),
+        errors: n("errors"),
+        pass_issued: n("issued_bytes_per_scan"),
+        pass_start: n("pass_start"),
+        pass_paused_secs: n("scrub_spent_paused"),
+    });
+    PoolStatus {
+        message: text("status"),
+        action: text("action"),
+        data_errors: p["error_count"].as_u64().unwrap_or(0),
+        scan,
+        vdevs,
+    }
+}
+
+fn push_vdev(v: &serde_json::Value, group: &'static str, depth: u8, out: &mut Vec<Vdev>) {
+    let s = |k: &str| v[k].as_str().unwrap_or("").to_string();
+    let n = |k: &str| v[k].as_u64().unwrap_or(0);
+    let note = v["aux"].as_str().map(str::to_string).or_else(|| v["was"].as_str().map(|w| format!("was {w}")));
+    out.push(Vdev {
+        name: s("name"),
+        kind: s("vdev_type"),
+        group,
+        depth,
+        state: s("state"),
+        read_errors: n("read_errors"),
+        write_errors: n("write_errors"),
+        checksum_errors: n("checksum_errors"),
+        slow_ios: v["slow_ios"].as_u64(),
+        note,
+    });
+    vdev_children(v, group, depth.saturating_add(1), out);
+}
+
+fn vdev_children(v: &serde_json::Value, group: &'static str, depth: u8, out: &mut Vec<Vdev>) {
+    for c in v["vdevs"].as_object().into_iter().flat_map(|m| m.values()) {
+        push_vdev(c, group, depth, out);
+    }
+}
+
 pub(crate) fn parse_zpool_list(text: &str) -> Vec<ZPool> {
     text.lines()
         .filter_map(|l| {
@@ -1730,6 +1868,53 @@ mod fixtures {
         assert_eq!(tcp.drops, n("connection-drops"));
         assert_eq!(tcp.bad_checksums, n("discard-bad-checksum"));
         assert_eq!(tcp.states.iter().find(|s| s.0 == "listen").unwrap().1, 7);
+    }
+
+    /// Captured from a single-file pool that has never been scrubbed.
+    #[test]
+    fn zpool_status_json() {
+        let pools = parse_zpool_status(&read("zpool-status.json")).unwrap();
+        let st = &pools["lpool"];
+        assert!(st.scan.is_none() && st.message.is_none());
+        assert_eq!(st.data_errors, 0);
+        assert_eq!(st.vdevs.len(), 1);
+        let v = &st.vdevs[0];
+        assert_eq!((v.name.as_str(), v.kind.as_str(), v.group, v.depth), ("/usr/legion-pool.img", "file", "", 0));
+        assert_eq!((v.state.as_str(), v.errors(), v.slow_ios), ("ONLINE", 0, Some(0)));
+    }
+
+    /// Written from OpenZFS 2.4.2's zpool_main.c JSON keys: a degraded
+    /// mirror, logs, cache, a spare and a scrub in progress.
+    #[test]
+    fn zpool_status_degraded_json() {
+        let pools = parse_zpool_status(&read("zpool-status-degraded.json")).unwrap();
+        let st = &pools["tank"];
+        assert_eq!(st.data_errors, 1);
+        assert!(st.message.as_deref().unwrap().starts_with("One or more devices are faulted in response to persistent errors. Sufficient"));
+        assert!(st.action.as_deref().unwrap().ends_with("mark the device repaired."));
+        let layout: Vec<(&str, &str, u8)> = st.vdevs.iter().map(|v| (v.name.as_str(), v.group, v.depth)).collect();
+        assert_eq!(
+            layout,
+            [
+                ("mirror-0", "", 0),
+                ("ada0p3", "", 1),
+                ("ada1p3", "", 1),
+                ("mirror-1", "", 0),
+                ("ada2p3", "", 1),
+                ("ada3p3", "", 1),
+                ("nda0p1", "logs", 0),
+                ("nda0p2", "cache", 0),
+                ("ada4p3", "spares", 0),
+            ]
+        );
+        let bad = &st.vdevs[2];
+        assert_eq!((bad.state.as_str(), bad.read_errors, bad.checksum_errors, bad.slow_ios), ("FAULTED", 2, 41, Some(12)));
+        assert_eq!(bad.note.as_deref(), Some("too many errors"));
+        assert!(!bad.healthy() && st.vdevs[8].healthy() && st.vdevs[0].slow_ios.is_none());
+        let sc = st.scan.as_ref().unwrap();
+        assert_eq!((sc.function.as_str(), sc.state.as_str(), sc.errors, sc.paused), ("scrub", "scanning", 3, false));
+        assert_eq!(sc.progress(), 0.25);
+        assert_eq!(sc.rate(sc.pass_start as f64 + 1024.0), Some(1073741824.0));
     }
 
     #[test]

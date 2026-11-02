@@ -9,7 +9,7 @@ jmon is a performance monitor for FreeBSD modelled on [nmon](https://nmon.source
   - disks, including latency and queue depth
   - network and TCP
   - filesystems
-  - ZFS ARC and pools
+  - ZFS ARC and pools, with each pool's devices, their read/write/checksum errors and slow I/Os, and scrub or resilver progress (OpenZFS 2.3 or later)
   - jails and bhyve VMs
   - temperatures, CPU clock and battery
   - top processes, with full command lines, I/O and a per-user filter
@@ -137,6 +137,8 @@ The service runs as `nobody` under daemon(8), which restarts it if it exits. `se
 | `freebsd.bhyve.{cpu.utilization,memory.usage}` | | `freebsd.bhyve.vm.name` |
 | `freebsd.zfs.arc.{size,target_size,max_size,hits,misses,hit_ratio}`, `freebsd.zfs.l2arc.{size,hits,misses}` | | |
 | `freebsd.zfs.pool.{usage,fragmentation,health,io,operations}` | | `zfs.pool.name`, `zfs.pool.state` / `.health`, `disk.io.direction` |
+| `freebsd.zfs.pool.data_errors`, `freebsd.zfs.pool.scan.{progress,errors}` | {error}, 1, {error} | `zfs.pool.name`, `zfs.scan.function`, `zfs.scan.state` |
+| `freebsd.zfs.vdev.{health,errors,slow_ios}` | | `zfs.pool.name`, `zfs.vdev.{name,type,group,state}`, `error.type` |
 | `process.{cpu.time,cpu.utilization,memory.usage,memory.virtual,disk.operations,paging.faults}` | | `process.pid`, `process.executable.name`, `process.owner`. Only emitted with `--export-top N` |
 | `jmon.collection.duration`, `jmon.otlp.exports`, `jmon.prometheus.scrapes` | | `result` |
 | `jmon.collector.{status,duration,last_success}` | 1, s, s | `jmon.collector`, `jmon.collector.state` |

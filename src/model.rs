@@ -385,6 +385,84 @@ pub struct ZPool {
     pub write_bytes: u64,
     pub read_ops: u64,
     pub write_ops: u64,
+    /// Devices, errors and scrub or resilver state from `zpool status`;
+    /// `None` when that could not be read (see the zpool_status collector).
+    pub status: Option<PoolStatus>,
+}
+
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct PoolStatus {
+    /// zpool status's explanation of a problem, and what to do about it.
+    pub message: Option<String>,
+    pub action: Option<String>,
+    /// Permanent errors: data ZFS could not repair.
+    pub data_errors: u64,
+    /// The last or current scrub or resilver, if there has been one.
+    pub scan: Option<PoolScan>,
+    /// Devices depth first; top-level vdevs have depth 0.
+    pub vdevs: Vec<Vdev>,
+}
+
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct PoolScan {
+    /// "scrub", "resilver" or "error scrub".
+    pub function: String,
+    /// "scanning", "finished" or "canceled".
+    pub state: String,
+    pub paused: bool,
+    /// Unix times; `end_time` is 0 while scanning.
+    pub start_time: u64,
+    pub end_time: u64,
+    pub to_examine: u64,
+    pub issued: u64,
+    pub errors: u64,
+    /// Bytes issued in this pass, when the pass started, and seconds it has
+    /// spent paused, for the current rate.
+    pub pass_issued: u64,
+    pub pass_start: u64,
+    pub pass_paused_secs: u64,
+}
+
+impl PoolScan {
+    /// Fraction done, as zpool status counts it (bytes issued of the total).
+    pub fn progress(&self) -> f64 {
+        if self.to_examine == 0 { 0.0 } else { (self.issued as f64 / self.to_examine as f64).min(1.0) }
+    }
+
+    /// Bytes per second issued in this pass, at Unix time `now`.
+    pub fn rate(&self, now: f64) -> Option<f64> {
+        let secs = now - self.pass_start as f64 - self.pass_paused_secs as f64;
+        (self.state == "scanning" && secs >= 1.0).then(|| self.pass_issued as f64 / secs)
+    }
+}
+
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct Vdev {
+    pub name: String,
+    /// mirror, raidz2, disk, file, ...
+    pub kind: String,
+    /// Empty for the main devices, else special, dedup, logs, cache or spares.
+    pub group: &'static str,
+    pub depth: u8,
+    pub state: String,
+    pub read_errors: u64,
+    pub write_errors: u64,
+    pub checksum_errors: u64,
+    /// Leaf devices only: I/Os slower than zio_slow_io_ms.
+    pub slow_ios: Option<u64>,
+    /// Why the device is not usable ("cannot open"), or the path it had.
+    pub note: Option<String>,
+}
+
+impl Vdev {
+    pub fn errors(&self) -> u64 {
+        self.read_errors + self.write_errors + self.checksum_errors
+    }
+
+    /// Whether the device is working as it should. Spares wait as AVAIL.
+    pub fn healthy(&self) -> bool {
+        matches!(self.state.as_str(), "ONLINE" | "AVAIL")
+    }
 }
 
 /// Why part of a process's detail could not be read.

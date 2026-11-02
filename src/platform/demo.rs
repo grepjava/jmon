@@ -326,7 +326,7 @@ impl Collector {
                 Jail { jid: 1, name: "www".into(), hostname: "www.example.org".into() },
                 Jail { jid: 2, name: "db".into(), hostname: "db.example.org".into() },
             ],
-            zfs: Some(Zfs { arc_size: arc, arc_target: arc + GIB / 2, ..self.zfs.clone() }),
+            zfs: Some(Zfs { arc_size: arc, arc_target: arc + GIB / 2, pools: self.pools(now_wall), ..self.zfs.clone() }),
             nfs: Some(self.nfs.clone()),
             collectors: COLLECTORS
                 .iter()
@@ -339,6 +339,46 @@ impl Collector {
                 })
                 .collect(),
         }
+    }
+}
+
+impl Collector {
+    /// The demo pool: a mirror plus a log and a cache device, mid-scrub.
+    fn pools(&self, now: f64) -> Vec<ZPool> {
+        let leaf = |name: &str, group: &'static str, depth: u8| Vdev {
+            name: name.into(),
+            kind: "disk".into(),
+            group,
+            depth,
+            state: "ONLINE".into(),
+            slow_ios: Some(0),
+            ..Default::default()
+        };
+        let mirror = Vdev { name: "mirror-0".into(), kind: "mirror".into(), state: "ONLINE".into(), ..Default::default() };
+        let total = 140 * GIB;
+        let started = now as u64 - 1800;
+        let issued = (total as f64 * ((now - started as f64) / 5400.0).min(1.0)) as u64;
+        self.zfs
+            .pools
+            .iter()
+            .map(|p| ZPool {
+                status: Some(PoolStatus {
+                    scan: Some(PoolScan {
+                        function: "scrub".into(),
+                        state: "scanning".into(),
+                        start_time: started,
+                        to_examine: total,
+                        issued,
+                        pass_issued: issued,
+                        pass_start: started,
+                        ..Default::default()
+                    }),
+                    vdevs: vec![mirror.clone(), leaf("nda0p3", "", 1), leaf("ada0p3", "", 1), leaf("nda1p1", "logs", 0), leaf("da0", "cache", 0)],
+                    ..Default::default()
+                }),
+                ..p.clone()
+            })
+            .collect()
     }
 }
 
@@ -362,6 +402,7 @@ const COLLECTORS: &[(&str, f64)] = &[
     ("jails", 0.02),
     ("arc", 0.03),
     ("zpool", 0.4),
+    ("zpool_status", 0.05),
 ];
 
 /// Synthetic detail for the demo processes: a few threads whose counters
