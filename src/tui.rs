@@ -2,7 +2,7 @@
 //! order they were opened.
 
 use crate::logring::LogRing;
-use crate::model::{DiskGroup, Snapshot};
+use crate::model::{Availability, DiskGroup, Snapshot};
 use crate::record::{Format, RecordSettings, Recorder};
 use crate::sample::{CpuUtil, DiskRate, GroupRate, Hub, Rates, Sample, group_rates};
 use anyhow::Result;
@@ -660,6 +660,14 @@ fn uptime(secs: f64) -> String {
     if d > 0 { format!("{d}d {h}h {m}m") } else { format!("{h}h {m}m") }
 }
 
+fn ago(secs: f64) -> String {
+    match secs.max(0.0) as u64 {
+        s @ 0..60 => format!("{s}s"),
+        s @ 60..3600 => format!("{}m {}s", s / 60, s % 60),
+        s => uptime(s as f64),
+    }
+}
+
 fn mb(b: u64) -> String {
     format!("{:.1}", b as f64 / 1048576.0)
 }
@@ -878,7 +886,7 @@ fn help_lines() -> Vec<Line<'static>> {
 
 fn resources(s: &Sample, status: &[String]) -> Vec<Line<'static>> {
     let h = &s.host;
-    vec![
+    let mut lines = vec![
         Line::raw(format!("Host      {}", h.hostname)),
         Line::raw(format!("OS        FreeBSD {} {}", h.os_release, h.machine)),
         Line::raw(format!("CPU       {} x {}", h.ncpu, h.cpu_model)),
@@ -886,7 +894,43 @@ fn resources(s: &Sample, status: &[String]) -> Vec<Line<'static>> {
         Line::raw(format!("Uptime    {}", uptime(s.snap.uptime))),
         Line::raw(format!("Exporting {}", if status.is_empty() { "nothing".into() } else { status.join(", ") })),
         Line::raw(format!("Sampling  last collection took {:.1} ms", s.collect_secs * 1000.0)),
-    ]
+    ];
+    lines.extend(collectors(&s.snap));
+    lines
+}
+
+/// Each collector's time in the last sample, coloured by state, then what went
+/// wrong with any that are not ok.
+fn collectors(snap: &Snapshot) -> Vec<Line<'static>> {
+    let style = |a: Availability| match a {
+        Availability::Ok => Style::default(),
+        Availability::Unsupported => DIM,
+        Availability::Partial | Availability::Stale => Style::default().fg(C_WRITE),
+        Availability::Denied | Availability::Failed => Style::default().fg(C_SYS).add_modifier(Modifier::BOLD),
+    };
+    let mut lines = Vec::new();
+    for row in snap.collectors.chunks(3) {
+        let mut spans = vec![Span::raw("  ")];
+        for c in row {
+            let time = if c.state == Availability::Ok {
+                format!("{:>6.2} ms", c.duration * 1000.0)
+            } else {
+                format!("{:>9}", c.state.as_str())
+            };
+            spans.push(Span::styled(format!("{:<12}{time}", c.name), style(c.state)));
+            spans.push(Span::raw("    "));
+        }
+        lines.push(Line::from(spans));
+    }
+    for c in snap.collectors.iter().filter(|c| c.state != Availability::Ok) {
+        let last = match c.last_ok {
+            Some(t) => format!("last ok {} ago", ago(snap.timestamp - t)),
+            None => "never read".into(),
+        };
+        let detail = c.detail.as_deref().unwrap_or("no detail");
+        lines.push(Line::styled(format!("  {} {}: {detail} ({last})", c.name, c.state.as_str()), style(c.state)));
+    }
+    lines
 }
 
 fn cpu_segments(u: &CpuUtil) -> [(f64, char, Color); 4] {
@@ -1106,13 +1150,17 @@ fn kernel(s: &Sample) -> Vec<Line<'static>> {
     } else {
         Style::default()
     };
-    lines.push(Line::from(vec![
-        Span::styled(format!("Run queue {:>4}", rq.runnable), rq_style),
-        Span::raw(format!(
-            "   Blocked on disk {:>3}   Page wait {:>3}   Sleeping {}   ({ncpu} CPUs)",
-            rq.disk_wait, rq.page_wait, rq.sleeping
-        )),
-    ]));
+    if snap.usable("runq") {
+        lines.push(Line::from(vec![
+            Span::styled(format!("Run queue {:>4}", rq.runnable), rq_style),
+            Span::raw(format!(
+                "   Blocked on disk {:>3}   Page wait {:>3}   Sleeping {}   ({ncpu} CPUs)",
+                rq.disk_wait, rq.page_wait, rq.sleeping
+            )),
+        ]));
+    } else {
+        lines.push(dim("Run queue unavailable (see Resources)"));
+    }
     lines.push(Line::raw(format!("Processes {}: {procs}", snap.processes.len())));
     lines
 }
@@ -1703,8 +1751,10 @@ fn checks(s: &Sample) -> Vec<Line<'static>> {
     let busy = 1.0 - r.cpu_total.idle;
     out.push((level(busy, 0.8, 0.95), format!("CPU busy {:.0}% (warn 80, danger 95)", busy * 100.0)));
     let ncpu = s.host.ncpu.max(1) as f64;
-    let rq = snap.runq.runnable as f64;
-    out.push((level(rq / ncpu, 1.0, 2.0), format!("Run queue {} for {} CPUs (warn > 1x, danger > 2x)", rq, ncpu)));
+    if snap.usable("runq") {
+        let rq = snap.runq.runnable as f64;
+        out.push((level(rq / ncpu, 1.0, 2.0), format!("Run queue {} for {} CPUs (warn > 1x, danger > 2x)", rq, ncpu)));
+    }
     let m = &snap.memory;
     if m.total > 0 {
         let avail = (m.free + m.inactive) as f64 / m.total as f64;
@@ -1772,6 +1822,16 @@ fn checks(s: &Sample) -> Vec<Line<'static>> {
         && (n.client_retries > 0.0 || n.client_timeouts > 0.0)
     {
         out.push((Level::Warning, format!("NFS client: {:.1} retries/s, {:.1} timeouts/s", n.client_retries, n.client_timeouts)));
+    }
+    for c in &snap.collectors {
+        let what = match c.state {
+            Availability::Denied => "permission denied",
+            Availability::Failed => "failed",
+            Availability::Stale => "stale",
+            _ => continue,
+        };
+        let detail = c.detail.as_deref().map(|d| format!(": {d}")).unwrap_or_default();
+        out.push((Level::Warning, format!("Collector {} {what}{detail}", c.name)));
     }
     out.sort_by_key(|(lv, _)| std::cmp::Reverse(*lv));
     let problems = out.iter().filter(|(lv, _)| *lv != Level::Ok).count();
@@ -1943,6 +2003,23 @@ mod render_tests {
         let first = c.collect();
         std::thread::sleep(Duration::from_millis(50));
         Sample::derive(1, c.host(), Some(&first), c.collect())
+    }
+
+    #[test]
+    fn failed_collectors_are_flagged_not_shown_as_zero() {
+        let mut s = demo_sample();
+        let rq = s.snap.collectors.iter_mut().find(|c| c.name == "runq").unwrap();
+        rq.state = Availability::Denied;
+        rq.detail = Some("vm.vmtotal: Operation not permitted".into());
+        let text = |lines: Vec<Line>| -> Vec<String> {
+            lines.iter().map(|l| l.spans.iter().map(|s| s.content.as_ref()).collect()).collect()
+        };
+        let checks = text(checks(&s));
+        assert!(checks.iter().any(|l| l.contains("Collector runq permission denied: vm.vmtotal")));
+        assert!(!checks.iter().any(|l| l.contains("Run queue")));
+        assert!(text(kernel(&s)).iter().any(|l| l.contains("Run queue unavailable")));
+        let res = text(resources(&s, &[]));
+        assert!(res.iter().any(|l| l.contains("runq denied: vm.vmtotal")));
     }
 
     #[test]

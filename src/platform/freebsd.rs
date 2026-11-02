@@ -277,6 +277,10 @@ pub struct Collector {
     sensor_lookup: Instant,
     geom: Option<GeomStats>,
     warned: std::collections::HashSet<&'static str>,
+    /// This sample's collector statuses, moved into the snapshot.
+    status: Vec<CollectorStatus>,
+    /// Wall clock of each collector's last successful read.
+    last_ok: HashMap<&'static str, f64>,
 }
 
 struct Mibs {
@@ -428,6 +432,8 @@ struct ZpoolCache {
     mibs: Vec<Vec<[Vec<libc::c_int>; 4]>>,
     /// Bytes written across all pools when `pools` was refreshed.
     written_at_refresh: u64,
+    /// Why the last refresh failed; `pools` then holds the last good list.
+    failure: Option<(Availability, String)>,
 }
 
 impl Collector {
@@ -459,6 +465,8 @@ impl Collector {
             sensor_lookup: Instant::now(),
             geom: None,
             warned: Default::default(),
+            status: Vec::new(),
+            last_ok: HashMap::new(),
         })
     }
 
@@ -468,36 +476,25 @@ impl Collector {
 
     pub fn collect(&mut self) -> Snapshot {
         let taken = Instant::now();
-        let cpus = self.ok("cpu", cpu_ticks(&self.mibs)).unwrap_or_default();
-        let memory = self.ok("memory", memory(&self.host, &self.mibs)).unwrap_or_default();
-        let swap = self.ok("swap", swap(self.host.pagesize)).unwrap_or_default();
-        let vm = vm_counters(&self.mibs);
-        let disks = self.ok("disks", disks(&self.mibs)).unwrap_or_default();
-        let nets = self.ok("network", nets()).unwrap_or_default();
-        let filesystems = self.ok("filesystems", filesystems()).unwrap_or_default();
-        let processes = match processes(self.host.pagesize) {
-            Ok((mut procs, starts)) => {
-                for (p, start) in procs.iter_mut().zip(starts) {
-                    p.user = self.user_name(p.uid);
-                    p.args = self.proc_args(p, start);
-                }
-                let live: std::collections::HashSet<i32> = procs.iter().map(|p| p.pid).collect();
-                self.args.retain(|pid, _| live.contains(pid));
-                procs
-            }
-            Err(e) => {
-                self.warn_once("processes", &e);
-                Vec::new()
-            }
-        };
-        let partitions = self.partitions(&disks);
+        let cpus = self.run("cpu", |c| cpu_ticks(&c.mibs)).unwrap_or_default();
+        let memory = self.run_partial("memory", |c| memory(&c.host, &c.mibs)).unwrap_or_default();
+        let swap = self.run("swap", |c| swap(c.host.pagesize)).unwrap_or_default();
+        let vm = self.run_partial("vm", |c| Ok(vm_counters(&c.mibs))).unwrap_or_default();
+        let disks = self.run("disks", |c| disks(&c.mibs)).unwrap_or_default();
+        let nets = self.run("network", |_| nets()).unwrap_or_default();
+        let filesystems = self.run("filesystems", |_| filesystems()).unwrap_or_default();
+        let processes = self.run("processes", Collector::processes).unwrap_or_default();
+        let partitions = self.run("geom", |c| c.partitions(&disks)).unwrap_or_default();
         let nfs_active = filesystems.iter().any(|f| f.fstype.starts_with("nfs"))
             || processes.iter().any(|p| p.command == "nfsd");
-        let nfs = if nfs_active { self.collect_nfs() } else { None };
-        let runq = self.mibs.vmtotal.raw().ok().and_then(|b| parse_vmtotal(&b)).unwrap_or_default();
-        let superpages = superpages(&self.mibs);
-        let tcp_snap = self.ok("tcp", tcp(&self.mibs)).flatten();
-        let udp_snap = udp(&self.mibs);
+        let nfs = if nfs_active { self.run("nfs", Collector::collect_nfs) } else { None };
+        let runq = self.run("runq", |c| runq(&c.mibs)).unwrap_or_default();
+        let superpages = self.run("superpages", |c| superpages(&c.mibs));
+        let tcp = self.run("tcp", |c| tcp(&c.mibs));
+        let udp = self.run("udp", |c| udp(&c.mibs));
+        let sensors = self.run("sensors", Collector::sensors).unwrap_or_default();
+        let jails = self.run("jails", |_| jails()).unwrap_or_default();
+        let zfs = self.zfs();
         Snapshot {
             taken,
             timestamp: unix_now(),
@@ -515,47 +512,53 @@ impl Collector {
             nets,
             filesystems,
             processes,
-            sensors: self.sensors(),
-            tcp: tcp_snap,
-            udp: udp_snap,
-            jails: self.ok("jails", jails()).unwrap_or_default(),
-            zfs: self.zfs(),
+            sensors,
+            tcp,
+            udp,
+            jails,
+            zfs,
             nfs,
+            collectors: std::mem::take(&mut self.status),
         }
     }
 
-    fn collect_nfs(&mut self) -> Option<Nfs> {
+    fn processes(&mut self) -> Result<Vec<Process>> {
+        let (mut procs, starts) = processes(self.host.pagesize)?;
+        for (p, start) in procs.iter_mut().zip(starts) {
+            p.user = self.user_name(p.uid);
+            p.args = self.proc_args(p, start);
+        }
+        let live: std::collections::HashSet<i32> = procs.iter().map(|p| p.pid).collect();
+        self.args.retain(|pid, _| live.contains(pid));
+        Ok(procs)
+    }
+
+    fn collect_nfs(&mut self) -> Result<Nfs> {
         let raw = self.mibs.nfs_stats.raw().ok();
         if let (Some(bytes), Some((prev_bytes, cached))) = (&raw, &self.nfs_cache)
             && bytes == prev_bytes
         {
-            return Some(cached.clone());
+            return Ok(cached.clone());
         }
-        let parsed = self.ok("nfs", nfs())?;
+        let parsed = nfs()?;
         if let Some(bytes) = raw {
             self.nfs_cache = Some((bytes, parsed.clone()));
         }
-        Some(parsed)
+        Ok(parsed)
     }
 
-    fn partitions(&mut self, disks: &[Disk]) -> Vec<Disk> {
+    fn partitions(&mut self, disks: &[Disk]) -> Result<Vec<Disk>> {
         if self.geom.is_none() {
-            match GeomStats::open() {
-                Ok(g) => self.geom = Some(g),
-                Err(e) => {
-                    self.warn_once("GEOM statistics", &e);
-                    return Vec::new();
-                }
-            }
+            self.geom = Some(GeomStats::open()?);
         }
         let geom = self.geom.as_mut().unwrap();
         let mut out = geom.read();
         // Whole disks are already in `disks` (from kern.devstat.all).
         out.retain(|p| !disks.iter().any(|d| d.name == p.name));
-        out
+        Ok(out)
     }
 
-    fn sensors(&mut self) -> Sensors {
+    fn sensors(&mut self) -> Result<Sensors> {
         if self.battery.as_ref().is_none_or(|(t, _)| t.elapsed() >= BATTERY_REFRESH) {
             self.battery = Some((Instant::now(), battery()));
         }
@@ -565,7 +568,14 @@ impl Collector {
         }
         let mut s = sensors(&self.mibs);
         s.battery = self.battery.as_ref().and_then(|(_, b)| b.clone());
-        s
+        if s.cpu_temps.is_empty() && s.cpu_freqs_mhz.is_empty() && s.thermal_zones.is_empty() && s.battery.is_none() {
+            return Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                "no CPU temperature or frequency, ACPI thermal zone or battery sysctls",
+            )
+            .into());
+        }
+        Ok(s)
     }
 
     fn proc_args(&mut self, p: &Process, start: i64) -> String {
@@ -580,29 +590,46 @@ impl Collector {
     }
 
     fn zfs(&mut self) -> Option<Zfs> {
-        let size = self.mibs.arc_size.uint().ok()?;
+        let mut z = self.run_partial("arc", |c| arc(&c.mibs))?;
+        z.pools = self.zpools();
+        Some(z)
+    }
+
+    fn zpools(&mut self) -> Vec<ZPool> {
+        let started = Instant::now();
         let written = |c: &ZpoolCache| -> u64 { c.mibs.iter().map(|m| pool_io(m)[1]).sum() };
-        let stale = match &self.zpools {
+        let due = match &self.zpools {
             None => true,
             Some(c) => {
                 let age = c.at.elapsed();
                 age >= ZPOOL_REFRESH || (age >= ZPOOL_REFRESH_BUSY && written(c) != c.written_at_refresh)
             }
         };
-        if stale {
-            let pools = match zpool_list() {
-                Ok(p) => p,
-                Err(e) => {
-                    self.warn_once("zpool list", &e);
-                    Vec::new()
+        if due {
+            match zpool_list() {
+                Ok(pools) => {
+                    let mibs = pools.iter().map(|p| dataset_mibs(&p.name)).collect();
+                    let mut cache =
+                        ZpoolCache { at: Instant::now(), pools, mibs, written_at_refresh: 0, failure: None };
+                    cache.written_at_refresh = written(&cache);
+                    self.zpools = Some(cache);
                 }
-            };
-            let mibs = pools.iter().map(|p| dataset_mibs(&p.name)).collect();
-            let mut cache = ZpoolCache { at: Instant::now(), pools, mibs, written_at_refresh: 0 };
-            cache.written_at_refresh = written(&cache);
-            self.zpools = Some(cache);
+                Err(e) => {
+                    // Keep the last good pool list, and retry at the normal pace.
+                    let failure = Some((Availability::of(&e), format!("{e:#}")));
+                    let cache = self.zpools.get_or_insert_with(|| ZpoolCache {
+                        at: Instant::now(),
+                        pools: Vec::new(),
+                        mibs: Vec::new(),
+                        written_at_refresh: 0,
+                        failure: None,
+                    });
+                    cache.at = Instant::now();
+                    cache.failure = failure;
+                }
+            }
         }
-        let cache = self.zpools.as_ref()?;
+        let cache = self.zpools.as_ref().unwrap();
         let mut pools = cache.pools.clone();
         for (pool, mibs) in pools.iter_mut().zip(&cache.mibs) {
             [pool.read_bytes, pool.write_bytes, pool.read_ops, pool.write_ops] = pool_io(mibs);
@@ -613,33 +640,60 @@ impl Collector {
                 pool.health = state.trim().to_string();
             }
         }
-        Some(Zfs {
-            arc_size: size,
-            arc_target: self.mibs.arc_c.uint_or_zero(),
-            arc_max: self.mibs.arc_c_max.uint_or_zero(),
-            arc_hits: self.mibs.arc_hits.uint_or_zero(),
-            arc_misses: self.mibs.arc_misses.uint_or_zero(),
-            l2_size: self.mibs.arc_l2_size.uint_or_zero(),
-            l2_hits: self.mibs.arc_l2_hits.uint_or_zero(),
-            l2_misses: self.mibs.arc_l2_misses.uint_or_zero(),
-            pools,
-        })
+        let (state, detail) = match &cache.failure {
+            None => (Availability::Ok, None),
+            Some((_, msg)) if !cache.pools.is_empty() => (Availability::Stale, Some(msg.clone())),
+            Some((state, msg)) => (*state, Some(msg.clone())),
+        };
+        self.report("zpool", state, detail, started.elapsed().as_secs_f64());
+        pools
     }
 
-    fn ok<T>(&mut self, what: &'static str, r: Result<T>) -> Option<T> {
+    fn run<T>(&mut self, name: &'static str, f: impl FnOnce(&mut Self) -> Result<T>) -> Option<T> {
+        self.run_partial(name, |c| f(c).map(|v| (v, Vec::new())))
+    }
+
+    /// Runs one collector, timing it and recording how it fared. `f` returns
+    /// its value and the names of any fields it had to leave at zero.
+    fn run_partial<T>(
+        &mut self,
+        name: &'static str,
+        f: impl FnOnce(&mut Self) -> Result<(T, Vec<&'static str>)>,
+    ) -> Option<T> {
+        let started = Instant::now();
+        let r = f(self);
+        let duration = started.elapsed().as_secs_f64();
         match r {
-            Ok(v) => Some(v),
+            Ok((v, missing)) if missing.is_empty() => {
+                self.report(name, Availability::Ok, None, duration);
+                Some(v)
+            }
+            Ok((v, missing)) => {
+                let detail = format!("unavailable: {}", missing.join(", "));
+                self.report(name, Availability::Partial, Some(detail), duration);
+                Some(v)
+            }
             Err(e) => {
-                self.warn_once(what, &e);
+                self.report(name, Availability::of(&e), Some(format!("{e:#}")), duration);
                 None
             }
         }
     }
 
-    fn warn_once(&mut self, what: &'static str, e: &anyhow::Error) {
-        if self.warned.insert(what) {
-            warn!("collecting {what}: {e:#}");
+    fn report(&mut self, name: &'static str, state: Availability, detail: Option<String>, duration: f64) {
+        if matches!(state, Availability::Ok | Availability::Partial) {
+            self.last_ok.insert(name, unix_now());
         }
+        // Unsupported is the normal state of a missing driver or module; the
+        // status says so without filling the log.
+        if !matches!(state, Availability::Ok | Availability::Unsupported)
+            && let Some(d) = &detail
+            && self.warned.insert(name)
+        {
+            warn!("collecting {name}: {d}");
+        }
+        let last_ok = self.last_ok.get(name).copied();
+        self.status.push(CollectorStatus { name, state, detail, last_ok, duration });
     }
 
     fn user_name(&mut self, uid: u32) -> String {
@@ -688,19 +742,25 @@ pub(crate) fn parse_cp_times(buf: &[u8]) -> Vec<CpuTicks> {
         .collect()
 }
 
-fn memory(host: &HostInfo, mibs: &Mibs) -> Result<Memory> {
+fn memory(host: &HostInfo, mibs: &Mibs) -> Result<(Memory, Vec<&'static str>)> {
     let pages = |m: &Mib, name: &str| -> Result<u64> {
         Ok(m.uint().with_context(|| name.to_string())? * host.pagesize)
     };
-    Ok(Memory {
+    let mut missing = Vec::new();
+    let laundry = pages(&mibs.v_laundry_count, "v_laundry_count").unwrap_or_else(|_| {
+        missing.push("v_laundry_count");
+        0
+    });
+    let mem = Memory {
         total: pages(&mibs.v_page_count, "v_page_count")?,
         active: pages(&mibs.v_active_count, "v_active_count")?,
         inactive: pages(&mibs.v_inactive_count, "v_inactive_count")?,
-        laundry: pages(&mibs.v_laundry_count, "v_laundry_count").unwrap_or(0),
+        laundry,
         wired: pages(&mibs.v_wire_count, "v_wire_count")?,
         free: pages(&mibs.v_free_count, "v_free_count")?,
         arc: mibs.arc_size.uint().ok(),
-    })
+    };
+    Ok((mem, missing))
 }
 
 fn swap(pagesize: u64) -> Result<Vec<SwapDev>> {
@@ -742,30 +802,43 @@ fn swap(pagesize: u64) -> Result<Vec<SwapDev>> {
     Ok(devs)
 }
 
-fn vm_counters(mibs: &Mibs) -> VmCounters {
-    VmCounters {
-        context_switches: mibs.v_swtch.uint_or_zero(),
-        interrupts: mibs.v_intr.uint_or_zero(),
-        syscalls: mibs.v_syscall.uint_or_zero(),
-        traps: mibs.v_trap.uint_or_zero(),
-        forks: mibs.v_forks.uint_or_zero() + mibs.v_vforks.uint_or_zero() + mibs.v_rforks.uint_or_zero(),
-        faults: mibs.v_vm_faults.uint_or_zero(),
-        swap_pages_in: mibs.v_swappgsin.uint_or_zero(),
-        swap_pages_out: mibs.v_swappgsout.uint_or_zero(),
-        swap_ins: mibs.v_swapin.uint_or_zero(),
-        swap_outs: mibs.v_swapout.uint_or_zero(),
-        vnode_ins: mibs.v_vnodein.uint_or_zero(),
-        vnode_outs: mibs.v_vnodeout.uint_or_zero(),
-        vnode_pages_in: mibs.v_vnodepgsin.uint_or_zero(),
-        vnode_pages_out: mibs.v_vnodepgsout.uint_or_zero(),
-        zero_fill_faults: mibs.v_zfod.uint_or_zero(),
-        cow_faults: mibs.v_cow_faults.uint_or_zero(),
-        intransit_faults: mibs.v_intrans.uint_or_zero(),
-        reactivated: mibs.v_reactivated.uint_or_zero(),
-        pages_freed: mibs.v_tfree.uint_or_zero(),
-        pageout_wakeups: mibs.v_pdwakeups.uint_or_zero(),
-        pageout_scanned: mibs.v_pdpages.uint_or_zero(),
-    }
+/// The counters and the names of any that could not be read (left at zero).
+fn vm_counters(mibs: &Mibs) -> (VmCounters, Vec<&'static str>) {
+    let mut missing = Vec::new();
+    let mut get = |m: &Mib, name: &'static str| {
+        m.uint().unwrap_or_else(|_| {
+            missing.push(name);
+            0
+        })
+    };
+    let vm = VmCounters {
+        context_switches: get(&mibs.v_swtch, "v_swtch"),
+        interrupts: get(&mibs.v_intr, "v_intr"),
+        syscalls: get(&mibs.v_syscall, "v_syscall"),
+        traps: get(&mibs.v_trap, "v_trap"),
+        forks: get(&mibs.v_forks, "v_forks") + get(&mibs.v_vforks, "v_vforks") + get(&mibs.v_rforks, "v_rforks"),
+        faults: get(&mibs.v_vm_faults, "v_vm_faults"),
+        swap_pages_in: get(&mibs.v_swappgsin, "v_swappgsin"),
+        swap_pages_out: get(&mibs.v_swappgsout, "v_swappgsout"),
+        swap_ins: get(&mibs.v_swapin, "v_swapin"),
+        swap_outs: get(&mibs.v_swapout, "v_swapout"),
+        vnode_ins: get(&mibs.v_vnodein, "v_vnodein"),
+        vnode_outs: get(&mibs.v_vnodeout, "v_vnodeout"),
+        vnode_pages_in: get(&mibs.v_vnodepgsin, "v_vnodepgsin"),
+        vnode_pages_out: get(&mibs.v_vnodepgsout, "v_vnodepgsout"),
+        zero_fill_faults: get(&mibs.v_zfod, "v_zfod"),
+        cow_faults: get(&mibs.v_cow_faults, "v_cow_faults"),
+        intransit_faults: get(&mibs.v_intrans, "v_intrans"),
+        reactivated: get(&mibs.v_reactivated, "v_reactivated"),
+        pages_freed: get(&mibs.v_tfree, "v_tfree"),
+        pageout_wakeups: get(&mibs.v_pdwakeups, "v_pdwakeups"),
+        pageout_scanned: get(&mibs.v_pdpages, "v_pdpages"),
+    };
+    (vm, missing)
+}
+
+fn runq(mibs: &Mibs) -> Result<RunQueue> {
+    parse_vmtotal(&mibs.vmtotal.raw().context("vm.vmtotal")?).context("vm.vmtotal: short read")
 }
 
 /// `struct vmtotal` from <sys/vmmeter.h>: nine uint64_t memory totals, then
@@ -778,12 +851,12 @@ pub(crate) fn parse_vmtotal(buf: &[u8]) -> Option<RunQueue> {
     Some(RunQueue { runnable: at(72)?, disk_wait: at(74)?, page_wait: at(76)?, sleeping: at(78)? })
 }
 
-fn superpages(mibs: &Mibs) -> Option<Superpages> {
-    Some(Superpages {
+fn superpages(mibs: &Mibs) -> Result<Superpages> {
+    Ok(Superpages {
         enabled: mibs.pg_ps_enabled.int().unwrap_or(0) != 0,
-        mappings: mibs.pde_mappings.uint().ok()?,
-        promotions: mibs.pde_promotions.uint().ok()?,
-        demotions: mibs.pde_demotions.uint().ok()?,
+        mappings: mibs.pde_mappings.uint().context("vm.pmap.pde.mappings")?,
+        promotions: mibs.pde_promotions.uint().context("vm.pmap.pde.promotions")?,
+        demotions: mibs.pde_demotions.uint().context("vm.pmap.pde.demotions")?,
         failures: mibs.pde_failures.uint_or_zero(),
     })
 }
@@ -1052,14 +1125,14 @@ const TCP_STATES: [&str; 11] = [
     "time_wait",
 ];
 
-fn tcp(mibs: &Mibs) -> Result<Option<Tcp>> {
-    let stats = mibs.tcp_stats.raw()?;
+fn tcp(mibs: &Mibs) -> Result<Tcp> {
+    let stats = mibs.tcp_stats.raw().context("net.inet.tcp.stats")?;
     let states = mibs.tcp_states.raw().unwrap_or_default();
-    Ok(parse_tcp(&stats, &states))
+    parse_tcp(&stats, &states).context("net.inet.tcp.stats: short read")
 }
 
-fn udp(mibs: &Mibs) -> Option<Udp> {
-    parse_udp(&mibs.udp_stats.raw().ok()?)
+fn udp(mibs: &Mibs) -> Result<Udp> {
+    parse_udp(&mibs.udp_stats.raw().context("net.inet.udp.stats")?).context("net.inet.udp.stats: short read")
 }
 
 /// `struct udpstat` from <netinet/udp_var.h>: uint64_t counters. Index 8 and
@@ -1139,6 +1212,30 @@ fn jails() -> Result<Vec<Jail>> {
 
 // ---------------------------------------------------------------------------
 // ZFS
+
+/// ARC counters; `pools` is filled in separately. Fails when ZFS is not loaded.
+fn arc(mibs: &Mibs) -> Result<(Zfs, Vec<&'static str>)> {
+    let size = mibs.arc_size.uint().context("kstat.zfs.misc.arcstats.size")?;
+    let mut missing = Vec::new();
+    let mut get = |m: &Mib, name: &'static str| {
+        m.uint().unwrap_or_else(|_| {
+            missing.push(name);
+            0
+        })
+    };
+    let z = Zfs {
+        arc_size: size,
+        arc_target: get(&mibs.arc_c, "c"),
+        arc_max: get(&mibs.arc_c_max, "c_max"),
+        arc_hits: get(&mibs.arc_hits, "hits"),
+        arc_misses: get(&mibs.arc_misses, "misses"),
+        l2_size: get(&mibs.arc_l2_size, "l2_size"),
+        l2_hits: get(&mibs.arc_l2_hits, "l2_hits"),
+        l2_misses: get(&mibs.arc_l2_misses, "l2_misses"),
+        pools: Vec::new(),
+    };
+    Ok((z, missing))
+}
 
 fn zpool_list() -> Result<Vec<ZPool>> {
     let out = std::process::Command::new("zpool")

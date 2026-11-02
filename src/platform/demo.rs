@@ -252,9 +252,10 @@ impl Collector {
         let active = 3 * GIB + (GIB as f64 * (t / 30.0).sin().abs()) as u64;
         let inactive = 2 * GIB;
         let laundry = 128 << 20;
+        let now_wall = unix_now();
         Snapshot {
             taken: now,
-            timestamp: unix_now(),
+            timestamp: now_wall,
             uptime: 86_400.0 * 3.0 + t,
             stathz: STATHZ,
             cpus: self.cpus.clone(),
@@ -327,6 +328,38 @@ impl Collector {
             ],
             zfs: Some(Zfs { arc_size: arc, arc_target: arc + GIB / 2, ..self.zfs.clone() }),
             nfs: Some(self.nfs.clone()),
+            collectors: COLLECTORS
+                .iter()
+                .map(|&(name, ms)| CollectorStatus {
+                    name,
+                    state: Availability::Ok,
+                    detail: None,
+                    last_ok: Some(now_wall),
+                    duration: ms / 1000.0,
+                })
+                .collect(),
         }
     }
 }
+
+/// The FreeBSD collectors with typical durations in milliseconds.
+const COLLECTORS: &[(&str, f64)] = &[
+    ("cpu", 0.02),
+    ("memory", 0.02),
+    ("swap", 0.03),
+    ("vm", 0.05),
+    ("disks", 0.04),
+    ("network", 0.06),
+    ("filesystems", 0.08),
+    ("processes", 1.9),
+    ("geom", 0.05),
+    ("nfs", 0.03),
+    ("runq", 0.01),
+    ("superpages", 0.01),
+    ("tcp", 0.03),
+    ("udp", 0.01),
+    ("sensors", 0.09),
+    ("jails", 0.02),
+    ("arc", 0.03),
+    ("zpool", 0.4),
+];

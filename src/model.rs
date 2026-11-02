@@ -239,6 +239,68 @@ pub struct Snapshot {
     pub zfs: Option<Zfs>,
     /// Present only while NFS is in use (an NFS mount or a running nfsd).
     pub nfs: Option<Nfs>,
+    /// How each collector fared this sample, so a zero or an empty list can be
+    /// told apart from data that could not be read.
+    pub collectors: Vec<CollectorStatus>,
+}
+
+/// Whether a collector's data in this snapshot can be trusted.
+// Only the FreeBSD collector can fail; the demo source is always ok.
+#[cfg_attr(not(target_os = "freebsd"), allow(dead_code))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Availability {
+    Ok,
+    /// Read, but some fields were unavailable and hold zero (see `detail`).
+    Partial,
+    /// The refresh failed; the values are from the last successful read.
+    Stale,
+    /// The kernel or system lacks it (no such sysctl, module or command).
+    Unsupported,
+    /// Not readable with jmon's privileges.
+    Denied,
+    Failed,
+}
+
+impl Availability {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Availability::Ok => "ok",
+            Availability::Partial => "partial",
+            Availability::Stale => "stale",
+            Availability::Unsupported => "unsupported",
+            Availability::Denied => "denied",
+            Availability::Failed => "failed",
+        }
+    }
+
+    /// Whether the collector's values reflect the system, if not fully or freshly.
+    pub fn usable(self) -> bool {
+        matches!(self, Availability::Ok | Availability::Partial | Availability::Stale)
+    }
+
+    /// Classifies a collection error by the OS error underneath it.
+    #[cfg_attr(not(target_os = "freebsd"), allow(dead_code))]
+    pub fn of(e: &anyhow::Error) -> Availability {
+        use std::io::ErrorKind;
+        match e.chain().find_map(|c| c.downcast_ref::<std::io::Error>()).map(|e| e.kind()) {
+            Some(ErrorKind::NotFound | ErrorKind::Unsupported) => Availability::Unsupported,
+            Some(ErrorKind::PermissionDenied) => Availability::Denied,
+            _ => Availability::Failed,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct CollectorStatus {
+    pub name: &'static str,
+    pub state: Availability,
+    /// The error, or for `partial` the fields that were unavailable.
+    pub detail: Option<String>,
+    /// Wall clock of the last successful read, seconds since the Unix epoch.
+    pub last_ok: Option<f64>,
+    /// Seconds this collector took in this sample.
+    pub duration: f64,
 }
 
 #[derive(Debug, Clone, Default, Serialize)]
@@ -352,7 +414,14 @@ impl Snapshot {
             jails: vec![],
             zfs: None,
             nfs: None,
+            collectors: vec![],
         }
+    }
+
+    /// Whether the named collector's data can be used. Collectors that did not
+    /// report (such as NFS while it is idle) count as usable.
+    pub fn usable(&self, collector: &str) -> bool {
+        self.collectors.iter().find(|c| c.name == collector).is_none_or(|c| c.state.usable())
     }
 
     pub fn cpu_total(&self) -> CpuTicks {
@@ -392,5 +461,38 @@ impl std::str::FromStr for DiskGroup {
             return Err("expected NAME=disk1,disk2".into());
         }
         Ok(DiskGroup { name: name.trim().to_string(), members })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use anyhow::Context;
+
+    fn io(kind: std::io::ErrorKind) -> anyhow::Error {
+        Err::<(), _>(std::io::Error::from(kind)).context("kern.example").unwrap_err()
+    }
+
+    #[test]
+    fn errors_classify_by_the_os_error_underneath() {
+        use std::io::ErrorKind;
+        assert_eq!(Availability::of(&io(ErrorKind::NotFound)), Availability::Unsupported);
+        assert_eq!(Availability::of(&io(ErrorKind::PermissionDenied)), Availability::Denied);
+        assert_eq!(Availability::of(&io(ErrorKind::InvalidData)), Availability::Failed);
+        assert_eq!(Availability::of(&anyhow::anyhow!("zpool list exited with 1")), Availability::Failed);
+    }
+
+    #[test]
+    fn unreported_collectors_count_as_usable() {
+        let mut s = Snapshot::empty();
+        s.collectors.push(CollectorStatus {
+            name: "runq",
+            state: Availability::Denied,
+            detail: None,
+            last_ok: None,
+            duration: 0.0,
+        });
+        assert!(!s.usable("runq"));
+        assert!(s.usable("nfs"));
     }
 }

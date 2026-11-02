@@ -154,6 +154,9 @@ catalog! {
     PoolIo => "freebsd.zfs.pool.io", "By", Counter, "Logical bytes read and written per pool.";
     PoolOps => "freebsd.zfs.pool.operations", "{operation}", Counter, "Logical read and write operations per pool.";
     SelfCollect => "jmon.collection.duration", "s", Gauge, "Time jmon took to collect the last sample.";
+    CollState => "jmon.collector.status", "1", UpDown, "1 for each collector, labelled with its state: ok, partial, stale, unsupported, denied or failed.";
+    CollDuration => "jmon.collector.duration", "s", Gauge, "Time each collector took in the last sample.";
+    CollLastOk => "jmon.collector.last_success", "s", Gauge, "Unix time of each collector's last successful read.";
     SelfExports => "jmon.otlp.exports", "{export}", Counter, "OTLP export attempts by result.";
     SelfScrapes => "jmon.prometheus.scrapes", "{scrape}", Counter, "Prometheus scrapes served.";
 }
@@ -185,18 +188,20 @@ pub fn collect(s: &Sample, top_procs: usize, stats: &SelfStats) -> Families {
     b.add(M::Load15, vec![], snap.load[2]);
 
     let mem = &snap.memory;
-    let total = mem.total.max(1) as f64;
-    for (state, v) in [
-        ("active", mem.active),
-        ("inactive", mem.inactive),
-        ("laundry", mem.laundry),
-        ("wired", mem.wired),
-        ("free", mem.free),
-    ] {
-        b.add(M::MemUsage, vec![("system.memory.state", state.into())], v as f64);
-        b.add(M::MemUtilization, vec![("system.memory.state", state.into())], v as f64 / total);
+    if snap.usable("memory") {
+        let total = mem.total.max(1) as f64;
+        for (state, v) in [
+            ("active", mem.active),
+            ("inactive", mem.inactive),
+            ("laundry", mem.laundry),
+            ("wired", mem.wired),
+            ("free", mem.free),
+        ] {
+            b.add(M::MemUsage, vec![("system.memory.state", state.into())], v as f64);
+            b.add(M::MemUtilization, vec![("system.memory.state", state.into())], v as f64 / total);
+        }
+        b.add(M::MemLimit, vec![], mem.total as f64);
     }
-    b.add(M::MemLimit, vec![], mem.total as f64);
     if let Some(arc) = mem.arc {
         b.add(M::ZfsArc, vec![], arc as f64);
     }
@@ -221,8 +226,10 @@ pub fn collect(s: &Sample, top_procs: usize, stats: &SelfStats) -> Families {
     b.add(M::PageFaults, vec![], vm.faults as f64);
     b.add(M::ProcCreated, vec![], vm.forks as f64);
     let rq = &snap.runq;
-    for (state, n) in [("runnable", rq.runnable), ("disk_wait", rq.disk_wait), ("page_wait", rq.page_wait), ("sleeping", rq.sleeping)] {
-        b.add(M::Threads, vec![("freebsd.thread.state", state.into())], n as f64);
+    if snap.usable("runq") {
+        for (state, n) in [("runnable", rq.runnable), ("disk_wait", rq.disk_wait), ("page_wait", rq.page_wait), ("sleeping", rq.sleeping)] {
+            b.add(M::Threads, vec![("freebsd.thread.state", state.into())], n as f64);
+        }
     }
     for (kind, n) in [("zero_fill", vm.zero_fill_faults), ("copy_on_write", vm.cow_faults), ("in_transit", vm.intransit_faults)] {
         b.add(M::VmFaults, vec![("freebsd.vm.fault_type", kind.into())], n as f64);
@@ -391,6 +398,14 @@ pub fn collect(s: &Sample, top_procs: usize, stats: &SelfStats) -> Families {
     }
 
     b.add(M::SelfCollect, vec![], s.collect_secs);
+    for c in &snap.collectors {
+        let name = || ("jmon.collector", Val::from(c.name));
+        b.add(M::CollState, vec![name(), ("jmon.collector.state", Val::from(c.state.as_str()))], 1.0);
+        b.add(M::CollDuration, vec![name()], c.duration);
+        if let Some(t) = c.last_ok {
+            b.add(M::CollLastOk, vec![name()], t);
+        }
+    }
     let ok = stats.export_ok.load(Ordering::Relaxed);
     let failed = stats.export_failed.load(Ordering::Relaxed);
     if ok + failed > 0 {

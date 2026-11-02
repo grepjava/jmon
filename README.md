@@ -137,8 +137,13 @@ The service runs as `nobody` under daemon(8), which restarts it if it exits. `se
 | `freebsd.zfs.pool.{usage,fragmentation,health,io,operations}` | | `zfs.pool.name`, `zfs.pool.state` / `.health`, `disk.io.direction` |
 | `process.{cpu.time,cpu.utilization,memory.usage,memory.virtual,disk.operations,paging.faults}` | | `process.pid`, `process.executable.name`, `process.owner`. Only emitted with `--export-top N` |
 | `jmon.collection.duration`, `jmon.otlp.exports`, `jmon.prometheus.scrapes` | | `result` |
+| `jmon.collector.{status,duration,last_success}` | 1, s, s | `jmon.collector`, `jmon.collector.state` |
 
 In Prometheus output, dots become underscores and the usual suffixes are added (for example `system_cpu_time_seconds_total`).
+
+### Missing data
+
+Each sample records how every collector fared: `ok`, `partial` (some fields could not be read and hold zero), `stale` (the refresh failed, so the values are from the last good read), `unsupported` (no such sysctl, driver or command), `denied` or `failed`. JSON output carries this as `collectors`, with the error, the time of the last successful read and the time taken. The exporters publish it as `jmon.collector.status`. A collector that is `unsupported`, `denied` or `failed` exports no series rather than zeros. For a `partial` collector, the status names the fields that hold zero. The Resources panel (`r`) lists the collectors, and Checks (`v`) warns about any that are denied, failed or stale.
 
 ## Testing
 
