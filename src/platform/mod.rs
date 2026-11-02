@@ -4,9 +4,9 @@
 #[cfg(target_os = "freebsd")]
 mod freebsd;
 #[cfg(target_os = "freebsd")]
-pub use freebsd::Collector;
+pub use freebsd::{Collector, proc_detail};
 
 #[cfg(not(target_os = "freebsd"))]
 mod demo;
 #[cfg(not(target_os = "freebsd"))]
-pub use demo::Collector;
+pub use demo::{Collector, proc_detail};

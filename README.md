@@ -13,6 +13,7 @@ jmon is a performance monitor for FreeBSD modelled on [nmon](https://nmon.source
   - jails and bhyve VMs
   - temperatures, CPU clock and battery
   - top processes, with full command lines, I/O and a per-user filter
+  - one process in detail: its threads with wait channels and context switches, open files against the limit, and resource limits
 - **OTLP push** over gRPC, HTTP/protobuf or HTTP/JSON, optionally over TLS. Names follow the OpenTelemetry semantic conventions.
 - **Prometheus** scrape endpoint.
 - **Capture files** in nmon CSV format (readable by nmon analyser and nmonchart) or JSON Lines, with daily rotation.
@@ -66,6 +67,7 @@ In the process list:
 - `a` shows full command lines.
 - `u` filters by user.
 - `/` searches by command, arguments, user or jail.
+- `Enter` asks for a PID (the first process in the list by default) and opens its detail screen: each thread's state, wait channel or blocking lock, CPU, context switches, faults and I/O; open descriptors by type against the `openfiles` limit; the executable, working directory and resource limits. It is read only while open, and `Esc` goes back. Open files of other users' processes need root.
 
 Anywhere:
 - `.` hides idle CPUs, disks, interfaces and processes.

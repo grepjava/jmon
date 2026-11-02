@@ -387,6 +387,82 @@ pub struct ZPool {
     pub write_ops: u64,
 }
 
+/// Why part of a process's detail could not be read.
+#[derive(Debug, Clone)]
+pub struct Unavailable {
+    pub state: Availability,
+    pub detail: String,
+}
+
+impl Unavailable {
+    #[cfg_attr(not(target_os = "freebsd"), allow(dead_code))]
+    pub fn of(e: &anyhow::Error) -> Unavailable {
+        Unavailable { state: Availability::of(e), detail: format!("{e:#}") }
+    }
+}
+
+/// One process looked at closely: read on demand for the detail screen, never
+/// part of a sample.
+#[derive(Debug, Clone)]
+pub struct ProcDetail {
+    /// Wall clock of the read, seconds since the Unix epoch.
+    pub taken: f64,
+    pub threads: Result<Vec<Thread>, Unavailable>,
+    pub files: Result<OpenFiles, Unavailable>,
+    pub limits: Result<Vec<Limit>, Unavailable>,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct Thread {
+    pub tid: i32,
+    pub name: String,
+    pub state: &'static str,
+    /// What a sleeping thread waits on (its wait message), or `*lock` when
+    /// blocked on a kernel lock.
+    pub wait: String,
+    pub last_cpu: i32,
+    pub priority: u8,
+    /// Cumulative CPU time in microseconds.
+    pub runtime_us: u64,
+    /// Cumulative voluntary and involuntary context switches.
+    pub voluntary_switches: u64,
+    pub involuntary_switches: u64,
+    pub minor_faults: u64,
+    pub major_faults: u64,
+    pub read_ops: u64,
+    pub write_ops: u64,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct OpenFiles {
+    /// Descriptors by type (vnode, socket, pipe, ...), most common first.
+    pub by_type: Vec<(&'static str, u64)>,
+    pub cwd: Option<String>,
+    pub executable: Option<String>,
+}
+
+impl OpenFiles {
+    pub fn total(&self) -> u64 {
+        self.by_type.iter().map(|(_, n)| n).sum()
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct Limit {
+    pub name: &'static str,
+    pub unit: LimitUnit,
+    /// `None` is unlimited.
+    pub soft: Option<u64>,
+    pub hard: Option<u64>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LimitUnit {
+    Seconds,
+    Bytes,
+    Count,
+}
+
 impl Snapshot {
     /// A snapshot with nothing in it, for tests to fill in.
     #[cfg(test)]

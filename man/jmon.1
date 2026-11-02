@@ -97,6 +97,14 @@ show full command lines in the process list
 show only one user's processes
 .It Cm /
 search processes by command, arguments, user or jail
+.It Cm Enter
+prompt for a PID, the first listed process by default, and show its
+detail: each thread's state, wait channel or blocking lock, CPU,
+context switches, faults and I/O; open descriptors by type against the
+openfiles limit; executable, working directory and resource limits.
+Open files of other users' processes need root.
+.Cm Esc
+returns to the panels
 .It Cm \&.
 hide idle CPUs, disks, interfaces and processes
 .It Cm p

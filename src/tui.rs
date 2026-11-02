@@ -2,7 +2,8 @@
 //! order they were opened.
 
 use crate::logring::LogRing;
-use crate::model::{Availability, DiskGroup, Snapshot};
+use crate::model::{Availability, DiskGroup, LimitUnit, ProcDetail, Snapshot, Unavailable};
+use crate::platform;
 use crate::record::{Format, RecordSettings, Recorder};
 use crate::sample::{CpuUtil, DiskRate, GroupRate, Hub, Rates, Sample, group_rates};
 use anyhow::Result;
@@ -111,6 +112,19 @@ enum TopSort {
 enum InputKind {
     User,
     Search,
+    Pid,
+}
+
+/// The process detail screen: which process, and its last two reads so
+/// per-thread rates can be shown.
+struct Detail {
+    pid: i32,
+    cur: ProcDetail,
+    prev: Option<ProcDetail>,
+    /// Sample the last read went with; a new sample triggers the next read.
+    seq: Option<u64>,
+    /// The panels' scroll offset, restored when the screen closes.
+    panel_scroll: usize,
 }
 
 const HISTORY: usize = 1024;
@@ -147,8 +161,10 @@ struct App {
     paused: Option<Arc<Sample>>,
     user_filter: Option<String>,
     search_filter: Option<String>,
-    /// Text being typed for the user or search filter.
+    /// Text being typed for the user or search filter, or a PID.
     input: Option<(InputKind, String)>,
+    /// Open process detail screen; it replaces the panels until closed.
+    detail: Option<Detail>,
     /// Vertical scroll offset (rows).
     scroll: usize,
     /// Largest useful `scroll` as of the last draw (unbounded before the first).
@@ -234,6 +250,7 @@ impl App {
             user_filter: None,
             search_filter: None,
             input: None,
+            detail: None,
             scroll: 0,
             max_scroll: Cell::new(usize::MAX),
             history: VecDeque::with_capacity(HISTORY),
@@ -269,6 +286,7 @@ impl App {
             {
                 self.last_seq = Some(s.seq);
                 self.record(s);
+                self.refresh_detail(s.seq);
                 dirty = true;
             }
             if last_repaint.elapsed() >= REPAINT {
@@ -338,11 +356,17 @@ impl App {
                 KeyCode::Enter => {
                     let v = buf.trim().to_string();
                     let val = (!v.is_empty()).then_some(v);
+                    let kind = *kind;
+                    self.input = None;
                     match kind {
                         InputKind::User => self.user_filter = val,
                         InputKind::Search => self.search_filter = val,
+                        InputKind::Pid => {
+                            if let Some(pid) = val.and_then(|v| v.parse().ok()) {
+                                self.open_detail(pid);
+                            }
+                        }
                     }
-                    self.input = None;
                 }
                 KeyCode::Esc => self.input = None,
                 KeyCode::Backspace => {
@@ -353,8 +377,17 @@ impl App {
             }
             return true;
         }
+        if self.detail.is_some() && matches!(code, KeyCode::Esc | KeyCode::Backspace) {
+            let d = self.detail.take().unwrap();
+            self.scroll = d.panel_scroll;
+            return true;
+        }
         match code {
             KeyCode::Char('q') | KeyCode::Esc => return false,
+            KeyCode::Enter => {
+                let pid = self.first_listed_pid().map(|p| p.to_string()).unwrap_or_default();
+                self.input = Some((InputKind::Pid, pid));
+            }
             KeyCode::Up | KeyCode::Char('[') => self.scroll_to(self.scroll.saturating_sub(1)),
             KeyCode::Down | KeyCode::Char(']') => self.scroll_to(self.scroll.saturating_add(1)),
             KeyCode::PageUp => self.scroll_to(self.scroll.saturating_sub(10)),
@@ -398,6 +431,36 @@ impl App {
             _ => {}
         }
         true
+    }
+
+    /// The process the list currently shows first, to offer as the default.
+    fn first_listed_pid(&self) -> Option<i32> {
+        let s = self.paused.clone().or_else(|| self.hub.latest())?;
+        let r = s.rates.as_ref()?;
+        let first = *top_order(&s, r, &self.view(0)).first()?;
+        Some(s.snap.processes[first].pid)
+    }
+
+    fn open_detail(&mut self, pid: i32) {
+        let panel_scroll = match self.detail.take() {
+            Some(d) => d.panel_scroll,
+            None => self.scroll,
+        };
+        let seq = self.paused.as_ref().map(|s| s.seq).or(self.last_seq);
+        self.detail = Some(Detail { pid, cur: platform::proc_detail(pid), prev: None, seq, panel_scroll });
+        self.scroll = 0;
+    }
+
+    /// Re-reads the open process once per new sample, so the rates cover a
+    /// sampling interval and nothing is read while the screen is closed.
+    fn refresh_detail(&mut self, seq: u64) {
+        if let Some(d) = &mut self.detail
+            && d.seq != Some(seq)
+        {
+            let new = platform::proc_detail(d.pid);
+            d.prev = Some(std::mem::replace(&mut d.cur, new));
+            d.seq = Some(seq);
+        }
     }
 
     fn scroll_to(&mut self, row: usize) {
@@ -463,6 +526,20 @@ impl App {
             f.render_widget(Paragraph::new("Collecting first sample..."), body);
             return;
         };
+        if let Some(d) = &self.detail {
+            let lines = detail(s, d, body.width.saturating_sub(2) as usize);
+            let rows = body.height.saturating_sub(2) as usize;
+            let max_scroll = lines.len().saturating_sub(rows);
+            self.max_scroll.set(max_scroll);
+            let command = s.snap.processes.iter().find(|p| p.pid == d.pid).map(|p| p.command.clone()).unwrap_or_default();
+            let block = Block::default().borders(Borders::ALL).border_style(DIM).title(Span::styled(
+                format!(" Process {} {command} ", d.pid),
+                Style::default().remove_modifier(Modifier::DIM).add_modifier(Modifier::BOLD),
+            ));
+            let offset = self.scroll.min(max_scroll) as u16;
+            f.render_widget(Paragraph::new(lines).block(block).scroll((offset, 0)), body);
+            return;
+        }
         if self.panels.is_empty() {
             f.render_widget(welcome(), body);
             return;
@@ -629,6 +706,7 @@ impl App {
             let prompt = match kind {
                 InputKind::User => " Show processes of user: ",
                 InputKind::Search => " Filter processes (command/args/user/jail/PID): ",
+                InputKind::Pid => " Process detail for PID: ",
             };
             return Paragraph::new(Line::from(vec![
                 Span::styled(prompt, Style::default().add_modifier(Modifier::REVERSED)),
@@ -636,7 +714,8 @@ impl App {
             ]));
         }
         let dim = DIM;
-        let mut spans = vec![Span::styled(" h=help q=quit ", Style::default().add_modifier(Modifier::REVERSED))];
+        let keys = if self.detail.is_some() { " Esc=back ↑↓=scroll q=quit " } else { " h=help q=quit " };
+        let mut spans = vec![Span::styled(keys, Style::default().add_modifier(Modifier::REVERSED))];
         for s in &self.status {
             spans.push(Span::styled(format!(" {s} │"), dim));
         }
@@ -836,6 +915,7 @@ const HELP_TOP: &[(&str, &str)] = &[
     ("a", "Full command lines"),
     ("u", "Filter by user"),
     ("/", "Search processes"),
+    ("Enter", "Process detail"),
 ];
 
 const HELP_MODES: &[(&str, &str)] = &[
@@ -1392,8 +1472,16 @@ fn filesystems(snap: &Snapshot, width: usize) -> Vec<Line<'static>> {
     lines
 }
 
-fn top(s: &Sample, v: &View) -> Vec<Line<'static>> {
-    let Some(r) = &s.rates else { return waiting() };
+fn jail_name(snap: &Snapshot, jid: i32) -> String {
+    if jid == 0 {
+        "-".into()
+    } else {
+        snap.jails.iter().find(|j| j.jid == jid).map_or_else(|| jid.to_string(), |j| clip(&j.name, 8))
+    }
+}
+
+/// Indices of the processes the list shows, in its order.
+fn top_order(s: &Sample, r: &Rates, v: &View) -> Vec<usize> {
     let snap = &s.snap;
     let mut order: Vec<usize> = (0..snap.processes.len()).collect();
     match v.sort {
@@ -1401,13 +1489,30 @@ fn top(s: &Sample, v: &View) -> Vec<Line<'static>> {
         TopSort::Mem => order.sort_by(|&a, &b| snap.processes[b].rss.cmp(&snap.processes[a].rss)),
         TopSort::Io => order.sort_by(|&a, &b| r.proc_io[b].total_cmp(&r.proc_io[a])),
     }
-    let jail_name = |jid: i32| -> String {
-        if jid == 0 {
-            "-".into()
-        } else {
-            snap.jails.iter().find(|j| j.jid == jid).map_or_else(|| jid.to_string(), |j| clip(&j.name, 8))
+    let search_lower = v.search_filter.as_ref().map(|q| q.to_lowercase());
+    order.retain(|&i| {
+        let p = &snap.processes[i];
+        if v.user_filter.as_ref().is_some_and(|u| &p.user != u) {
+            return false;
         }
-    };
+        if let Some(q) = &search_lower {
+            let matches = p.command.to_lowercase().contains(q)
+                || p.args.to_lowercase().contains(q)
+                || p.user.to_lowercase().contains(q)
+                || jail_name(snap, p.jid).to_lowercase().contains(q)
+                || p.pid.to_string().contains(q);
+            if !matches {
+                return false;
+            }
+        }
+        !(v.busy_only && r.proc_cpu[i] < 0.1 && r.proc_io[i] < 0.05)
+    });
+    order
+}
+
+fn top(s: &Sample, v: &View) -> Vec<Line<'static>> {
+    let Some(r) = &s.rates else { return waiting() };
+    let snap = &s.snap;
     let sort = match v.sort {
         TopSort::Cpu => "CPU",
         TopSort::Mem => "memory",
@@ -1420,7 +1525,6 @@ fn top(s: &Sample, v: &View) -> Vec<Line<'static>> {
     if let Some(q) = &v.search_filter {
         filters.push_str(&format!(", filter {q}"));
     }
-    let search_lower = v.search_filter.as_ref().map(|q| q.to_lowercase());
     let mut lines = vec![hdr(format!(
         "{:>7} {:>6} {:>8} {:>8} {:>7} {:>7} {:>6} {:>4} {:<9} {:<10} {:<8} Command   (by {sort}{filters})",
         "PID",
@@ -1435,27 +1539,11 @@ fn top(s: &Sample, v: &View) -> Vec<Line<'static>> {
         "User",
         "Jail",
     ))];
-    for i in order {
+    for i in top_order(s, r, v) {
         let p = &snap.processes[i];
-        if v.user_filter.as_ref().is_some_and(|u| &p.user != u) {
-            continue;
-        }
-        let jname = jail_name(p.jid);
-        if let Some(q) = &search_lower {
-            let matches = p.command.to_lowercase().contains(q)
-                || p.args.to_lowercase().contains(q)
-                || p.user.to_lowercase().contains(q)
-                || jname.to_lowercase().contains(q)
-                || p.pid.to_string().contains(q);
-            if !matches {
-                continue;
-            }
-        }
+        let jname = jail_name(snap, p.jid);
         let cpu = r.proc_cpu[i];
         let io = r.proc_io[i];
-        if v.busy_only && cpu < 0.1 && io < 0.05 {
-            continue;
-        }
         let style = if cpu >= 50.0 {
             Style::default().fg(C_SYS)
         } else if cpu >= 10.0 {
@@ -1481,6 +1569,189 @@ fn top(s: &Sample, v: &View) -> Vec<Line<'static>> {
             ),
             style,
         ));
+    }
+    lines
+}
+
+/// CPU time like top(1): minutes:seconds.hundredths, or hours:minutes:seconds.
+fn cpu_time(us: u64) -> String {
+    let secs = us / 1_000_000;
+    if secs >= 3600 {
+        format!("{}:{:02}:{:02}", secs / 3600, secs % 3600 / 60, secs % 60)
+    } else {
+        format!("{}:{:02}.{:02}", secs / 60, secs % 60, us % 1_000_000 / 10_000)
+    }
+}
+
+fn unavailable(what: &str, u: &Unavailable) -> Line<'static> {
+    let hint = if u.state == Availability::Denied { " (other users' processes need root)" } else { "" };
+    Line::styled(
+        format!("{what} {}: {}{hint}", u.state.as_str(), u.detail),
+        Style::default().fg(C_WRITE),
+    )
+}
+
+/// The process detail screen: summary, open files, limits, then threads.
+fn detail(s: &Sample, d: &Detail, width: usize) -> Vec<Line<'static>> {
+    let snap = &s.snap;
+    let mut lines = Vec::new();
+    let i = snap.processes.iter().position(|p| p.pid == d.pid);
+    match i {
+        None => lines.push(Line::styled(
+            format!("PID {} is not running: it has exited, or there is no such process", d.pid),
+            Style::default().fg(C_WRITE),
+        )),
+        Some(i) => {
+            let p = &snap.processes[i];
+            lines.push(Line::raw(format!(
+                "User {}   Jail {}   Parent {}   State {}   Threads {}",
+                p.user,
+                jail_name(snap, p.jid),
+                p.ppid,
+                p.state,
+                p.threads
+            )));
+            lines.push(Line::raw(format!("Command    {}", p.args)));
+            let started = chrono::DateTime::from_timestamp_micros(p.start_time)
+                .map(|t| t.with_timezone(&chrono::Local).format("%Y-%m-%d %H:%M:%S").to_string())
+                .unwrap_or_default();
+            lines.push(Line::raw(format!(
+                "Started    {started} ({} ago)   CPU time {} (user {}, system {})",
+                ago(snap.timestamp - p.start_time as f64 / 1e6),
+                cpu_time(p.cpu_time_us),
+                cpu_time(p.user_time_us),
+                cpu_time(p.sys_time_us)
+            )));
+            if let Some(r) = &s.rates {
+                lines.push(Line::raw(format!(
+                    "Now        CPU {:.1}% ({:.1}% user, {:.1}% system)   faults {:.0}/s ({:.1} major)   block I/O {:.1}/s",
+                    r.proc_cpu[i],
+                    r.proc_user_cpu[i],
+                    r.proc_sys_cpu[i],
+                    r.proc_faults[i].0 + r.proc_faults[i].1,
+                    r.proc_faults[i].1,
+                    r.proc_io[i]
+                )));
+            }
+            lines.push(Line::raw(format!("Memory     resident {}   virtual {}", human(p.rss), human(p.vsize))));
+        }
+    }
+
+    let limits = d.cur.limits.as_ref().ok();
+    let soft = |name: &str| limits.and_then(|l| l.iter().find(|l| l.name == name)).and_then(|l| l.soft);
+    match &d.cur.files {
+        Ok(f) => {
+            if f.executable.is_some() || f.cwd.is_some() {
+                lines.push(Line::raw(format!(
+                    "Executable {}   cwd {}",
+                    f.executable.as_deref().unwrap_or("?"),
+                    f.cwd.as_deref().unwrap_or("?")
+                )));
+            }
+            let total = f.total();
+            let kinds = f.by_type.iter().map(|(k, n)| format!("{k} {n}")).collect::<Vec<_>>().join(", ");
+            let (of, style) = match soft("openfiles") {
+                Some(lim) if lim > 0 => {
+                    let used = total as f64 / lim as f64;
+                    let style = if used >= 0.95 {
+                        Style::default().fg(C_SYS).add_modifier(Modifier::BOLD)
+                    } else if used >= 0.8 {
+                        Style::default().fg(C_WRITE)
+                    } else {
+                        Style::default()
+                    };
+                    (format!(" of {lim} ({:.0}%)", used * 100.0), style)
+                }
+                _ => (String::new(), Style::default()),
+            };
+            lines.push(Line::styled(format!("Open files {total}{of}: {kinds}"), style));
+        }
+        Err(u) => lines.push(unavailable("Open files", u)),
+    }
+
+    match &d.cur.limits {
+        Ok(limits) => {
+            lines.push(hdr("Resource limits (soft / hard)".into()));
+            let value = |v: Option<u64>, unit: LimitUnit| match (v, unit) {
+                (None, _) => "infinity".to_string(),
+                (Some(v), LimitUnit::Bytes) => human(v),
+                (Some(v), LimitUnit::Seconds) => format!("{v}s"),
+                (Some(v), LimitUnit::Count) => v.to_string(),
+            };
+            const CELL: usize = 16 + 1 + 9 + 3 + 9;
+            let per_row = (width.saturating_sub(2) / (CELL + 3)).max(1);
+            let (unlimited, set): (Vec<_>, Vec<_>) = limits.iter().partition(|l| l.soft.is_none() && l.hard.is_none());
+            for row in set.chunks(per_row) {
+                let cells: Vec<String> = row
+                    .iter()
+                    .map(|l| format!("{:<16} {:>9} / {:<9}", l.name, value(l.soft, l.unit), value(l.hard, l.unit)))
+                    .collect();
+                lines.push(Line::raw(format!("  {}", cells.join("   "))));
+            }
+            if !unlimited.is_empty() {
+                let names: Vec<&str> = unlimited.iter().map(|l| l.name).collect();
+                lines.push(dim(format!("  unlimited: {}", names.join(", "))));
+            }
+        }
+        Err(u) => lines.push(unavailable("Resource limits", u)),
+    }
+
+    match &d.cur.threads {
+        Ok(threads) => {
+            let dt = d.prev.as_ref().map(|p| d.cur.taken - p.taken).filter(|&dt| dt > 0.0);
+            let prev = d.prev.as_ref().and_then(|p| p.threads.as_ref().ok());
+            let before = |tid: i32| prev.and_then(|ts| ts.iter().find(|t| t.tid == tid));
+            let rate = |now: u64, then: u64| dt.map(|dt| now.saturating_sub(then) as f64 / dt);
+            let mut rows: Vec<_> = threads
+                .iter()
+                .map(|t| {
+                    let b = before(t.tid);
+                    let r = |f: fn(&crate::model::Thread) -> u64| b.and_then(|b| rate(f(t), f(b)));
+                    let cpu = r(|t| t.runtime_us).map(|us| us / 1e4);
+                    (t, cpu, r(|t| t.voluntary_switches), r(|t| t.involuntary_switches), r(|t| t.minor_faults + t.major_faults), r(|t| t.read_ops + t.write_ops))
+                })
+                .collect();
+            rows.sort_by(|a, b| {
+                b.1.unwrap_or(-1.0).total_cmp(&a.1.unwrap_or(-1.0)).then(b.0.runtime_us.cmp(&a.0.runtime_us))
+            });
+            lines.push(hdr(format!(
+                "{:>7} {:<16} {:<9} {:<14} {:>6} {:>3} {:>3} {:>8} {:>8} {:>7} {:>6} {:>10}",
+                "TID", "Thread", "State", "Wait", "%CPU", "CPU", "PRI", "Vcsw/s", "Ivcsw/s", "Flt/s", "IO/s", "Time"
+            )));
+            let opt = |v: Option<f64>, prec: usize| v.map_or("-".to_string(), |v| format!("{v:.prec$}"));
+            for (t, cpu, vcsw, ivcsw, flt, io) in rows {
+                let c = cpu.unwrap_or(0.0);
+                let style = if c >= 50.0 {
+                    Style::default().fg(C_SYS)
+                } else if c >= 10.0 || t.wait.starts_with('*') {
+                    Style::default().fg(C_WRITE)
+                } else {
+                    Style::default()
+                };
+                lines.push(Line::styled(
+                    format!(
+                        "{:>7} {:<16} {:<9} {:<14} {:>6} {:>3} {:>3} {:>8} {:>8} {:>7} {:>6} {:>10}",
+                        t.tid,
+                        clip(&t.name, 16),
+                        t.state,
+                        clip(if t.wait.is_empty() { "-" } else { &t.wait }, 14),
+                        opt(cpu, 1),
+                        t.last_cpu,
+                        t.priority,
+                        opt(vcsw, 0),
+                        opt(ivcsw, 0),
+                        opt(flt, 0),
+                        opt(io, 1),
+                        cpu_time(t.runtime_us)
+                    ),
+                    style,
+                ));
+            }
+            if dt.is_none() {
+                lines.push(dim("Rates appear after the next sample. Wait: what a sleeping thread waits on; *name = blocked on that kernel lock."));
+            }
+        }
+        Err(u) => lines.push(unavailable("Threads", u)),
     }
     lines
 }
@@ -2006,6 +2277,58 @@ mod render_tests {
     }
 
     #[test]
+    fn process_detail_opens_refreshes_and_closes() {
+        let s = Arc::new(demo_sample());
+        let mut app = App::new(Hub::new(Duration::from_secs(2), 0), "t", vec![], LogRing::default());
+        app.paused = Some(s.clone());
+        app.scroll = 3;
+        let text = |lines: Vec<Line>| -> Vec<String> {
+            lines.iter().map(|l| l.spans.iter().map(|s| s.content.as_ref()).collect()).collect()
+        };
+
+        // Enter offers the process the list shows first.
+        app.key(KeyCode::Enter, KeyModifiers::NONE);
+        let first = s.snap.processes[top_order(&s, s.rates.as_ref().unwrap(), &app.view(0))[0]].pid;
+        assert_eq!(app.input.as_ref().map(|(_, b)| b.clone()), Some(first.to_string()));
+        for _ in 0..10 {
+            app.key(KeyCode::Backspace, KeyModifiers::NONE);
+        }
+        for c in "5200".chars() {
+            app.key(KeyCode::Char(c), KeyModifiers::NONE);
+        }
+        app.key(KeyCode::Enter, KeyModifiers::NONE);
+        assert_eq!(app.detail.as_ref().map(|d| d.pid), Some(5200));
+        assert_eq!(app.scroll, 0);
+        let lines = text(detail(&s, app.detail.as_ref().unwrap(), 118));
+        assert!(lines.iter().any(|l| l.contains("vcpu 0")));
+        assert!(lines.iter().any(|l| l.starts_with("Open files denied: kern.proc.filedesc.5200")));
+        assert!(lines.iter().any(|l| l.contains("openfiles")));
+        assert!(lines.iter().any(|l| l.contains("unlimited: cputime, filesize")));
+        assert!(lines.iter().any(|l| l.starts_with("Rates appear after the next sample")));
+
+        // The next sample re-reads it, and per-thread rates appear.
+        std::thread::sleep(Duration::from_millis(20));
+        app.refresh_detail(s.seq + 1);
+        let lines = text(detail(&s, app.detail.as_ref().unwrap(), 118));
+        assert!(!lines.iter().any(|l| l.starts_with("Rates appear")));
+        let mut t = Terminal::new(TestBackend::new(120, 30)).unwrap();
+        t.draw(|f| app.draw(f, Some(&s))).unwrap();
+
+        // Open files are measured against the soft limit.
+        app.open_detail(1201);
+        let lines = text(detail(&s, app.detail.as_ref().unwrap(), 118));
+        assert!(lines.iter().any(|l| l.starts_with("Open files 34 of 36 (94%)")), "{lines:?}");
+
+        // Esc goes back to the panels where they were.
+        app.key(KeyCode::Esc, KeyModifiers::NONE);
+        assert!(app.detail.is_none());
+        assert_eq!(app.scroll, 3);
+        app.open_detail(999_999);
+        let lines = text(detail(&s, app.detail.as_ref().unwrap(), 118));
+        assert!(lines[0].contains("PID 999999 is not running"));
+    }
+
+    #[test]
     fn failed_collectors_are_flagged_not_shown_as_zero() {
         let mut s = demo_sample();
         let rq = s.snap.collectors.iter_mut().find(|c| c.name == "runq").unwrap();
@@ -2141,5 +2464,34 @@ mod alignment_tests {
         // Every row ends at the same column, so the MTU/Link columns line up.
         let ends: Vec<usize> = lines.iter().map(|l| l.trim_end_matches(['u', 'p', 'd', 'o', 'w', 'n', 'L', 'i', 'k', ' ']).len()).collect();
         assert!(ends.windows(2).all(|w| w[0] == w[1]), "{ends:?}");
+    }
+}
+
+/// Prints the detail screen for `JMON_DETAIL_PID` with live data, to check it
+/// by eye: `JMON_DETAIL_PID=1 cargo test show_detail -- --ignored --nocapture`.
+#[cfg(test)]
+mod live_tests {
+    use super::*;
+    use crate::platform::Collector;
+    use ratatui::backend::TestBackend;
+
+    #[test]
+    #[ignore]
+    fn show_detail() {
+        let pid: i32 = std::env::var("JMON_DETAIL_PID").expect("JMON_DETAIL_PID").parse().unwrap();
+        let mut c = Collector::new().unwrap();
+        let first = c.collect();
+        let mut app = App::new(Hub::new(Duration::from_secs(1), 0), "t", vec![], LogRing::default());
+        app.open_detail(pid);
+        std::thread::sleep(Duration::from_secs(1));
+        let s = Sample::derive(1, c.host(), Some(&first), c.collect());
+        app.refresh_detail(1);
+        let (w, h) = (130, 45);
+        let mut t = Terminal::new(TestBackend::new(w, h)).unwrap();
+        t.draw(|f| app.draw(f, Some(&s))).unwrap();
+        let buf = t.backend().buffer();
+        for y in 0..h {
+            println!("{}", (0..w).map(|x| buf[(x, y)].symbol().to_string()).collect::<String>().trim_end());
+        }
     }
 }

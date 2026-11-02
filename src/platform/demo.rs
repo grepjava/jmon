@@ -74,7 +74,7 @@ impl Collector {
             .into(),
             command: cmd.into(),
             state: "sleeping",
-            threads: 1,
+            threads: if pid == 5200 { 7 } else { 1 },
             start_time: 1_700_000_000_000_000 + pid as i64,
             ..Default::default()
         })
@@ -363,3 +363,76 @@ const COLLECTORS: &[(&str, f64)] = &[
     ("arc", 0.03),
     ("zpool", 0.4),
 ];
+
+/// Synthetic detail for the demo processes: a few threads whose counters
+/// advance with the clock, typical limits, and open files denied for root's
+/// processes as they would be to an unprivileged user.
+pub fn proc_detail(pid: i32) -> ProcDetail {
+    let now = unix_now();
+    let t = now - 1_790_000_000.0;
+    let names: Vec<String> = match pid {
+        5200 => {
+            let mut v: Vec<String> = (0..4).map(|i| format!("vcpu {i}")).collect();
+            v.extend(["mevent".into(), "blk-4:0-0".into(), "vtnet-5:0 tx".into()]);
+            v
+        }
+        1201 | 1202 => vec!["nginx".into()],
+        2210 | 2211 => vec!["postgres".into()],
+        3300 => vec!["cc1plus".into()],
+        _ => (0..1 + pid as usize % 3).map(|i| if i == 0 { "main".into() } else { format!("worker {i}") }).collect(),
+    };
+    let threads = names
+        .into_iter()
+        .enumerate()
+        .map(|(i, name)| {
+            let share = 1.0 / (1 + i) as f64 * if pid == 3300 || pid == 5200 { 0.6 } else { 0.02 };
+            let busy = share > 0.1;
+            Thread {
+                tid: 100_000 + pid * 10 + i as i32,
+                name,
+                state: if busy { "running" } else { "sleeping" },
+                wait: if busy { String::new() } else if i == 0 { "kqread".into() } else { "uwait".into() },
+                last_cpu: (pid + i as i32) % NCPU as i32,
+                priority: if busy { 100 } else { 120 },
+                runtime_us: (t * 1e6 * share) as u64,
+                voluntary_switches: (t * 40.0 * (1.0 - share)) as u64,
+                involuntary_switches: (t * 30.0 * share) as u64,
+                minor_faults: (t * 5.0 * share) as u64,
+                major_faults: 0,
+                read_ops: (t * 0.5 * share) as u64,
+                write_ops: (t * 0.3 * share) as u64,
+            }
+        })
+        .collect();
+    let files = if [1, 12, 450, 812, 4100, 5200].contains(&pid) {
+        Err(Unavailable {
+            state: Availability::Denied,
+            detail: format!("kern.proc.filedesc.{pid}: Operation not permitted (os error 1)"),
+        })
+    } else {
+        Ok(OpenFiles {
+            by_type: vec![("vnode", 18), ("socket", 9 + pid as u64 % 7), ("kqueue", 1), ("pipe", 2)],
+            cwd: Some("/".into()),
+            executable: Some(format!("/usr/local/bin/demo-{pid}")),
+        })
+    };
+    let unlimited = |name, unit| Limit { name, unit, soft: None, hard: None };
+    let limits = vec![
+        unlimited("cputime", LimitUnit::Seconds),
+        unlimited("filesize", LimitUnit::Bytes),
+        Limit { name: "datasize", unit: LimitUnit::Bytes, soft: Some(32 * GIB), hard: Some(32 * GIB) },
+        Limit { name: "stacksize", unit: LimitUnit::Bytes, soft: Some(512 << 20), hard: Some(512 << 20) },
+        unlimited("coredumpsize", LimitUnit::Bytes),
+        unlimited("memoryuse", LimitUnit::Bytes),
+        Limit { name: "memorylocked", unit: LimitUnit::Bytes, soft: Some(64 << 10), hard: Some(64 << 10) },
+        Limit { name: "maxprocesses", unit: LimitUnit::Count, soft: Some(6_656), hard: Some(6_656) },
+        Limit { name: "openfiles", unit: LimitUnit::Count, soft: Some(if pid == 1201 { 36 } else { 116_946 }), hard: Some(116_946) },
+        unlimited("sbsize", LimitUnit::Bytes),
+        unlimited("vmemoryuse", LimitUnit::Bytes),
+        unlimited("pseudo-terminals", LimitUnit::Count),
+        unlimited("swapuse", LimitUnit::Bytes),
+        unlimited("kqueues", LimitUnit::Count),
+        unlimited("umtxp", LimitUnit::Count),
+    ];
+    ProcDetail { taken: now, threads: Ok(threads), files, limits: Ok(limits) }
+}

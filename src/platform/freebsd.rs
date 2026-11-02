@@ -1058,6 +1058,150 @@ fn proc_args(pid: i32) -> Option<String> {
 }
 
 // ---------------------------------------------------------------------------
+// Process detail, read only while the detail screen is open
+
+/// Threads, open files and resource limits of one process.
+pub fn proc_detail(pid: i32) -> ProcDetail {
+    let read = |op: libc::c_int, what: &str| -> Result<Vec<u8>> {
+        sysctl_mib_raw(&[libc::CTL_KERN, libc::KERN_PROC, op, pid]).with_context(|| format!("{what}.{pid}"))
+    };
+    let threads = read(libc::KERN_PROC_PID | libc::KERN_PROC_INC_THREAD, "kern.proc.pid").and_then(|b| parse_threads(&b));
+    // kern.proc.nfds only answers for the calling process, so count the
+    // descriptors kern.proc.filedesc lists.
+    let files = read(libc::KERN_PROC_FILEDESC, "kern.proc.filedesc").map(|b| parse_filedesc(&b));
+    ProcDetail {
+        taken: unix_now(),
+        threads: threads.map_err(|e| Unavailable::of(&e)),
+        files: files.map_err(|e| Unavailable::of(&e)),
+        limits: limits(pid).map_err(|e| Unavailable::of(&e)),
+    }
+}
+
+/// kinfo_proc records from kern.proc.pid with KERN_PROC_INC_THREAD: one per
+/// thread, with that thread's state, wait channel and rusage.
+pub(crate) fn parse_threads(buf: &[u8]) -> Result<Vec<Thread>> {
+    if buf.len() < size_of::<libc::c_int>() {
+        return Ok(Vec::new());
+    }
+    let stride = i32::from_ne_bytes(buf[..4].try_into().unwrap()) as usize;
+    if stride < size_of::<libc::kinfo_proc>() {
+        bail!("kinfo_proc size {stride} smaller than expected {}", size_of::<libc::kinfo_proc>());
+    }
+    Ok(buf
+        .chunks_exact(stride)
+        .map(|c| {
+            let k: libc::kinfo_proc = unsafe { std::ptr::read_unaligned(c.as_ptr().cast()) };
+            let mut name = cchars(&k.ki_tdname);
+            name.push_str(&cchars(&k.ki_moretdname));
+            let wait = if k.ki_kiflag as usize & libc::KI_LOCKBLOCK != 0 {
+                format!("*{}", cchars(&k.ki_lockname))
+            } else {
+                cchars(&k.ki_wmesg)
+            };
+            let ru = &k.ki_rusage;
+            Thread {
+                tid: k.ki_tid,
+                name,
+                state: proc_state(k.ki_stat),
+                wait,
+                last_cpu: k.ki_lastcpu,
+                priority: k.ki_pri.pri_level,
+                runtime_us: k.ki_runtime,
+                voluntary_switches: ru.ru_nvcsw.max(0) as u64,
+                involuntary_switches: ru.ru_nivcsw.max(0) as u64,
+                minor_faults: ru.ru_minflt.max(0) as u64,
+                major_faults: ru.ru_majflt.max(0) as u64,
+                read_ops: ru.ru_inblock.max(0) as u64,
+                write_ops: ru.ru_oublock.max(0) as u64,
+            }
+        })
+        .collect())
+}
+
+fn file_type(kf_type: libc::c_int) -> &'static str {
+    match kf_type {
+        libc::KF_TYPE_VNODE => "vnode",
+        libc::KF_TYPE_SOCKET => "socket",
+        libc::KF_TYPE_PIPE => "pipe",
+        libc::KF_TYPE_FIFO => "fifo",
+        libc::KF_TYPE_KQUEUE => "kqueue",
+        libc::KF_TYPE_MQUEUE => "mqueue",
+        libc::KF_TYPE_SHM => "shm",
+        libc::KF_TYPE_SEM => "sem",
+        libc::KF_TYPE_PTS => "pts",
+        libc::KF_TYPE_PROCDESC => "procdesc",
+        libc::KF_TYPE_DEV => "dev",
+        13 => "eventfd",
+        14 => "timerfd",
+        _ => "other",
+    }
+}
+
+/// Packed kinfo_file records from kern.proc.filedesc, each starting with its
+/// own size. Negative descriptors are the cwd, root, executable and so on.
+pub(crate) fn parse_filedesc(buf: &[u8]) -> OpenFiles {
+    let int = |b: &[u8], at: usize| b.get(at..at + 4).map(|x| i32::from_ne_bytes(x.try_into().unwrap()));
+    let path_at = std::mem::offset_of!(libc::kinfo_file, kf_path);
+    let mut counts: HashMap<&'static str, u64> = HashMap::new();
+    let mut out = OpenFiles::default();
+    let mut rest = buf;
+    while let (Some(size), Some(kind), Some(fd)) = (int(rest, 0), int(rest, 4), int(rest, 8)) {
+        let size = size as usize;
+        if size < 12 || size > rest.len() {
+            break;
+        }
+        let rec = &rest[..size];
+        let path = || rec.get(path_at..).map(cstr_bytes).filter(|p| !p.is_empty());
+        match fd {
+            libc::KF_FD_TYPE_CWD => out.cwd = path(),
+            libc::KF_FD_TYPE_TEXT => out.executable = path(),
+            fd if fd >= 0 => *counts.entry(file_type(kind)).or_default() += 1,
+            _ => {}
+        }
+        rest = &rest[size..];
+    }
+    out.by_type = counts.into_iter().collect();
+    out.by_type.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(b.0)));
+    out
+}
+
+/// RLIMIT_* in order, named as procstat -l names them.
+const LIMITS: [(&str, LimitUnit); 15] = [
+    ("cputime", LimitUnit::Seconds),
+    ("filesize", LimitUnit::Bytes),
+    ("datasize", LimitUnit::Bytes),
+    ("stacksize", LimitUnit::Bytes),
+    ("coredumpsize", LimitUnit::Bytes),
+    ("memoryuse", LimitUnit::Bytes),
+    ("memorylocked", LimitUnit::Bytes),
+    ("maxprocesses", LimitUnit::Count),
+    ("openfiles", LimitUnit::Count),
+    ("sbsize", LimitUnit::Bytes),
+    ("vmemoryuse", LimitUnit::Bytes),
+    ("pseudo-terminals", LimitUnit::Count),
+    ("swapuse", LimitUnit::Bytes),
+    ("kqueues", LimitUnit::Count),
+    ("umtxp", LimitUnit::Count),
+];
+
+fn limits(pid: i32) -> Result<Vec<Limit>> {
+    let value = |v: libc::rlim_t| (v != libc::RLIM_INFINITY).then_some(v as u64);
+    LIMITS
+        .iter()
+        .enumerate()
+        .map(|(i, &(name, unit))| {
+            let b = sysctl_mib_raw(&[libc::CTL_KERN, libc::KERN_PROC, libc::KERN_PROC_RLIMIT, pid, i as libc::c_int])
+                .with_context(|| format!("kern.proc.rlimit.{pid} {name}"))?;
+            if b.len() < size_of::<libc::rlimit>() {
+                bail!("kern.proc.rlimit.{pid} {name}: short read");
+            }
+            let rl: libc::rlimit = unsafe { std::ptr::read_unaligned(b.as_ptr().cast()) };
+            Ok(Limit { name, unit, soft: value(rl.rlim_cur), hard: value(rl.rlim_max) })
+        })
+        .collect()
+}
+
+// ---------------------------------------------------------------------------
 // Sensors
 
 fn sysctl_celsius(name: &str) -> Option<f64> {
@@ -1650,5 +1794,47 @@ mod fixtures_more {
         assert_eq!(u.full_socket_buffers, 7);
         assert_eq!(u.datagrams_out, 200);
         assert!(parse_udp(&raw[..80]).is_none());
+    }
+}
+
+#[cfg(test)]
+mod detail_tests {
+    use super::*;
+
+    /// The test process inspects itself, so the expected answers are known.
+    #[test]
+    fn detail_of_own_process() {
+        let d = proc_detail(std::process::id() as i32);
+        let threads = d.threads.expect("threads");
+        // libtest names each test's thread after the test (cut to MAXCOMLEN).
+        assert!(threads.iter().any(|t| "platform::freebsd::detail_tests::detail_of_own_process".starts_with(&t.name)));
+        assert!(threads.iter().all(|t| t.tid > 0));
+
+        let files = d.files.expect("own files are readable");
+        assert!(files.total() >= 3, "{files:?}");
+        let exe = std::env::current_exe().unwrap();
+        assert_eq!(files.executable.as_deref(), exe.to_str());
+        let cwd = std::env::current_dir().unwrap();
+        assert_eq!(files.cwd.as_deref(), cwd.to_str());
+
+        let limits = d.limits.expect("limits");
+        assert_eq!(limits.len(), LIMITS.len());
+        let mut rl = libc::rlimit { rlim_cur: 0, rlim_max: 0 };
+        assert_eq!(unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut rl) }, 0);
+        let nofile = limits.iter().find(|l| l.name == "openfiles").unwrap();
+        assert_eq!(nofile.soft, Some(rl.rlim_cur as u64));
+    }
+
+    /// Without root, another user's descriptors are off limits but its
+    /// threads and limits are not.
+    #[test]
+    fn detail_of_init() {
+        let d = proc_detail(1);
+        assert!(d.threads.is_ok());
+        assert!(d.limits.is_ok());
+        if unsafe { libc::geteuid() } != 0 {
+            let e = d.files.expect_err("init's files need root");
+            assert_eq!(e.state, Availability::Denied, "{}", e.detail);
+        }
     }
 }
