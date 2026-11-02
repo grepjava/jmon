@@ -144,7 +144,10 @@ catalog! {
     ArcHits => "freebsd.zfs.arc.hits", "{hit}", Counter, "ZFS ARC hits.";
     ArcMisses => "freebsd.zfs.arc.misses", "{miss}", Counter, "ZFS ARC misses.";
     ArcHitRatio => "freebsd.zfs.arc.hit_ratio", "1", Gauge, "ZFS ARC hit ratio over the last interval.";
+    ArcMax => "freebsd.zfs.arc.max_size", "By", UpDown, "ZFS ARC maximum size (c_max).";
     L2Size => "freebsd.zfs.l2arc.size", "By", UpDown, "ZFS L2ARC size.";
+    L2Hits => "freebsd.zfs.l2arc.hits", "{hit}", Counter, "ZFS L2ARC hits.";
+    L2Misses => "freebsd.zfs.l2arc.misses", "{miss}", Counter, "ZFS L2ARC misses.";
     PoolUsage => "freebsd.zfs.pool.usage", "By", UpDown, "ZFS pool space allocated and free.";
     PoolFrag => "freebsd.zfs.pool.fragmentation", "1", Gauge, "ZFS pool free-space fragmentation.";
     PoolHealth => "freebsd.zfs.pool.health", "1", UpDown, "1 for each pool, labelled with its health state.";
@@ -363,8 +366,13 @@ pub fn collect(s: &Sample, top_procs: usize, stats: &SelfStats) -> Families {
         b.add(M::ArcTarget, vec![], z.arc_target as f64);
         b.add(M::ArcHits, vec![], z.arc_hits as f64);
         b.add(M::ArcMisses, vec![], z.arc_misses as f64);
+        if z.arc_max > 0 {
+            b.add(M::ArcMax, vec![], z.arc_max as f64);
+        }
         if z.l2_size > 0 {
             b.add(M::L2Size, vec![], z.l2_size as f64);
+            b.add(M::L2Hits, vec![], z.l2_hits as f64);
+            b.add(M::L2Misses, vec![], z.l2_misses as f64);
         }
         for p in &z.pools {
             let pool = || ("zfs.pool.name", Val::from(p.name.clone()));

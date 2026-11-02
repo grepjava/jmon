@@ -133,7 +133,7 @@ The service runs as `nobody` under daemon(8), which restarts it if it exits. `se
 | `hw.battery.charge`, `hw.battery.time_left` | 1, s | `hw.id`, `hw.battery.state` |
 | `freebsd.jail.{cpu.utilization,memory.usage,process.count,io.operations}` | | `freebsd.jail.id`, `freebsd.jail.name` |
 | `freebsd.bhyve.{cpu.utilization,memory.usage}` | | `freebsd.bhyve.vm.name` |
-| `freebsd.zfs.arc.{size,target_size,hits,misses,hit_ratio}`, `freebsd.zfs.l2arc.size` | | |
+| `freebsd.zfs.arc.{size,target_size,max_size,hits,misses,hit_ratio}`, `freebsd.zfs.l2arc.{size,hits,misses}` | | |
 | `freebsd.zfs.pool.{usage,fragmentation,health,io,operations}` | | `zfs.pool.name`, `zfs.pool.state` / `.health`, `disk.io.direction` |
 | `process.{cpu.time,cpu.utilization,memory.usage,memory.virtual,disk.operations,paging.faults}` | | `process.pid`, `process.executable.name`, `process.owner`. Only emitted with `--export-top N` |
 | `jmon.collection.duration`, `jmon.otlp.exports`, `jmon.prometheus.scrapes` | | `result` |
