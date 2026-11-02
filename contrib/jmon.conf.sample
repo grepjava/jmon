@@ -25,3 +25,10 @@ prometheus = "127.0.0.1:9464"
 
 # Disk groups, shown with the `g` key and recorded as nmon DG* sections.
 #disk-group = ["mirror=ada0,ada1", "data=da0,da1,da2"]
+
+# Save the samples around each problem that lasts (a Checks warning or
+# danger) as JSON Lines; play them back with jmon --replay FILE.
+#incident-dir = "/var/log/jmon/incidents"
+#incident-sustain = 30            # seconds a problem must last
+#incident-before = 300            # seconds kept from before it
+#incident-after = 300             # seconds recorded after it clears

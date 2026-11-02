@@ -16,6 +16,9 @@
 .Op Fl -prometheus Ar addr
 .Op Fl -config Ar path
 .Op Ar options ...
+.Nm
+.Fl -replay Ar file
+.Op Fl -show Ar keys
 .Sh DESCRIPTION
 .Nm
 shows CPU, memory, disk, network, filesystem, process, jail, ZFS and sensor
@@ -240,6 +243,40 @@ busiest processes.
 Off by default because process metrics have high cardinality.
 .It Fl -once
 Print one sample as JSON and exit.
+.It Fl -replay Ar file
+Play back a JSON Lines recording on the screen instead of watching this
+system, at the recorded pace.
+.Cm p
+or space plays and pauses,
+.Cm Left
+and
+.Cm Right
+step one sample,
+.Cm <
+and
+.Cm >
+jump a tenth of the recording, and
+.Cm +
+and
+.Cm -
+double or halve the speed.
+The process detail screen is not available, since it reads the live system.
+Works on any operating system.
+.It Fl -incident-dir Ar dir
+Keep recent samples in memory and, when a check from the checks panel
+stays at warning or danger, save them and the samples that follow to
+.Ar dir Ns Pa / Ns Ar host Ns Pa _incident_ Ns Ar YYMMDD_HHMMSS Ns Pa .jsonl
+until the problems have cleared, for
+.Fl -replay .
+.It Fl -incident-sustain Ar seconds
+How long a problem must last to start an incident.
+Default 30.
+.It Fl -incident-before Ar seconds
+How much to keep from before an incident.
+Default 300.
+.It Fl -incident-after Ar seconds
+How long to keep recording after an incident's problems clear.
+Default 300.
 .It Fl -config Ar path
 Read options from a TOML file.
 Default
@@ -335,6 +372,12 @@ service jmon start
 .Pp
 Record a day of one-minute samples to daily nmon files kept for a month:
 .Dl jmon -f -s 60 --rotate --record-keep 30 --record-dir /var/log/jmon
+.Pp
+Save the minutes around each problem that lasts, then play one back:
+.Bd -literal -offset indent
+jmon -d --incident-dir /var/log/jmon/incidents
+jmon --replay /var/log/jmon/incidents/web1_incident_261102_031544.jsonl
+.Ed
 .Sh SEE ALSO
 .Xr netstat 1 ,
 .Xr systat 1 ,

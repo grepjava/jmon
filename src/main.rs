@@ -2,7 +2,9 @@
 //! OpenTelemetry metrics (OTLP gRPC/HTTP), a Prometheus endpoint, and
 //! nmon-compatible capture files.
 
+mod checks;
 mod config;
+mod incident;
 mod logring;
 mod metrics;
 mod model;
@@ -10,6 +12,7 @@ mod otel;
 mod platform;
 mod prom;
 mod record;
+mod replay;
 mod sample;
 mod tui;
 
@@ -110,6 +113,26 @@ pub struct Cli {
     #[arg(long)]
     once: bool,
 
+    /// Save the samples around each lasting problem (a Checks warning or danger) to this directory as JSON Lines, for --replay
+    #[arg(long, value_name = "DIR")]
+    incident_dir: Option<PathBuf>,
+
+    /// Seconds a problem must last to start an incident
+    #[arg(long, value_name = "SECS", default_value_t = 30.0)]
+    incident_sustain: f64,
+
+    /// Seconds of samples to keep from before an incident
+    #[arg(long, value_name = "SECS", default_value_t = 300.0)]
+    incident_before: f64,
+
+    /// Seconds to keep recording after an incident's problems clear
+    #[arg(long, value_name = "SECS", default_value_t = 300.0)]
+    incident_after: f64,
+
+    /// Play back a JSON Lines recording on the screen instead of watching this system
+    #[arg(long, value_name = "PATH", conflicts_with_all = ["daemon", "once", "auto_record", "record", "prometheus", "otlp_endpoint", "count"])]
+    replay: Option<PathBuf>,
+
     /// Write log messages to this file
     #[arg(long, value_name = "PATH")]
     log_file: Option<PathBuf>,
@@ -138,11 +161,18 @@ fn main() -> Result<()> {
     if [cli.interval, cli.otlp_interval].iter().any(|v| !v.is_finite() || *v <= 0.0) {
         bail!("intervals must be positive");
     }
+    if [cli.incident_sustain, cli.incident_before, cli.incident_after].iter().any(|v| !v.is_finite() || *v < 0.0) {
+        bail!("incident times must not be negative");
+    }
     let headless = cli.daemon || cli.auto_record || cli.record.as_deref() == Some("-");
     let screen = !headless && !cli.once;
 
     let ring = LogRing::default();
     init_logging(screen, cli.syslog, cli.log_file.as_ref(), &ring)?;
+
+    if let Some(path) = &cli.replay {
+        return replay(&cli, path, ring);
+    }
 
     let collector = platform::Collector::new().context("initialising collector")?;
     let host = collector.host();
@@ -186,6 +216,19 @@ fn main() -> Result<()> {
         status.push(format!("rec {path}"));
     }
 
+    if let Some(dir) = &cli.incident_dir {
+        let secs = |v: f64| Duration::from_secs_f64(v.max(0.0));
+        let settings = incident::Settings {
+            dir: dir.clone(),
+            sustain: secs(cli.incident_sustain),
+            before: secs(cli.incident_before),
+            after: secs(cli.incident_after),
+        };
+        sinks.push(Box::new(incident::Incidents::new(settings).with_context(|| format!("creating {}", dir.display()))?));
+        info!("recording incidents to {}", dir.display());
+        status.push(format!("incidents {}", dir.display()));
+    }
+
     let provider = if cli.otlp_endpoint.is_some() || otel::env_configured() {
         let cfg = OtelConfig {
             endpoint: cli.otlp_endpoint.clone(),
@@ -226,7 +269,7 @@ fn main() -> Result<()> {
             let record_format = cli.record_format;
             std::thread::Builder::new()
                 .name("jmon-screen".into())
-                .spawn(move || tui::run(hub, &show, status, ring, groups, record_dir, record_format))?
+                .spawn(move || tui::run(hub, &show, status, ring, groups, record_dir, record_format, None))?
         };
         // crossterm 0.29 reads a hung-up terminal forever (read returns 0 and
         // it only stops on EWOULDBLOCK), so the screen thread never sees a
@@ -265,6 +308,28 @@ fn main() -> Result<()> {
     }
     rt.shutdown_timeout(Duration::from_secs(2));
     Ok(())
+}
+
+/// Shows a JSON Lines recording on the screen; needs no collector, so it
+/// works on any system.
+fn replay(cli: &Cli, path: &std::path::Path, ring: LogRing) -> Result<()> {
+    let rec = replay::Recording::open(path)?;
+    let hub = Hub::new(Duration::from_secs(1), 0);
+    let (control, player) = replay::spawn(hub.clone(), rec)?;
+    let status = vec![format!("replay {}", path.display())];
+    let res = tui::run(
+        hub.clone(),
+        &cli.show,
+        status,
+        ring,
+        cli.disk_groups.clone(),
+        cli.record_dir.clone(),
+        cli.record_format,
+        Some(control),
+    );
+    hub.request_stop();
+    let _ = player.join();
+    res
 }
 
 fn once(mut collector: platform::Collector) -> Result<()> {

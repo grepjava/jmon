@@ -1,9 +1,11 @@
 //! nmon-style interactive screen: single-key toggles stack panels in the
 //! order they were opened.
 
+use crate::checks::Level;
 use crate::logring::LogRing;
 use crate::model::{Availability, DiskGroup, LimitUnit, ProcDetail, Snapshot, Unavailable};
 use crate::platform;
+use crate::replay::{self, Cmd};
 use crate::record::{Format, RecordSettings, Recorder};
 use crate::sample::{CpuUtil, DiskRate, GroupRate, Hub, Rates, Sample, group_rates};
 use anyhow::Result;
@@ -168,6 +170,8 @@ struct App {
     input: Option<(InputKind, String)>,
     /// Open process detail screen; it replaces the panels until closed.
     detail: Option<Detail>,
+    /// Playing back a recording instead of watching this system.
+    replay: Option<replay::Control>,
     /// Vertical scroll offset (rows).
     scroll: usize,
     /// Largest useful `scroll` as of the last draw (unbounded before the first).
@@ -188,6 +192,7 @@ struct App {
     log: LogRing,
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn run(
     hub: Arc<Hub>,
     show: &str,
@@ -196,8 +201,10 @@ pub fn run(
     groups: Vec<DiskGroup>,
     record_dir: PathBuf,
     record_format: Format,
+    replay: Option<replay::Control>,
 ) -> Result<()> {
     let mut app = App::new(hub, show, status, log);
+    app.replay = replay;
     app.groups = groups;
     app.record_dir = record_dir;
     app.record_format = record_format;
@@ -254,6 +261,7 @@ impl App {
             search_filter: None,
             input: None,
             detail: None,
+            replay: None,
             scroll: 0,
             max_scroll: Cell::new(usize::MAX),
             history: VecDeque::with_capacity(HISTORY),
@@ -287,6 +295,12 @@ impl App {
             if let Some(s) = &sample
                 && self.last_seq != Some(s.seq)
             {
+                // A replay that went back starts its history again.
+                if self.last_seq.is_some_and(|last| s.seq < last) {
+                    self.history.clear();
+                    self.cpu_peaks.clear();
+                    self.temp_peak = None;
+                }
                 self.last_seq = Some(s.seq);
                 self.record(s);
                 self.refresh_detail(s.seq);
@@ -380,6 +394,29 @@ impl App {
             }
             return true;
         }
+        if let Some(player) = &self.replay {
+            let cmd = match code {
+                KeyCode::Char('p') | KeyCode::Char(' ') => Cmd::Toggle,
+                KeyCode::Left => Cmd::Step(-1),
+                KeyCode::Right => Cmd::Step(1),
+                KeyCode::Char('<') => Cmd::Seek(-0.1),
+                KeyCode::Char('>') => Cmd::Seek(0.1),
+                KeyCode::Char('+') => Cmd::Speed(2.0),
+                KeyCode::Char('-') => Cmd::Speed(0.5),
+                KeyCode::Enter | KeyCode::Char('w') => {
+                    tracing::info!("not available in a replay: it needs the live system");
+                    return true;
+                }
+                _ => return self.key_live(code),
+            };
+            player.send(cmd);
+            return true;
+        }
+        self.key_live(code)
+    }
+
+    /// Keys with the same meaning live and in a replay.
+    fn key_live(&mut self, code: KeyCode) -> bool {
         if self.detail.is_some() && matches!(code, KeyCode::Esc | KeyCode::Backspace) {
             let d = self.detail.take().unwrap();
             self.scroll = d.panel_scroll;
@@ -667,14 +704,34 @@ impl App {
             let when = chrono::DateTime::from_timestamp(s.snap.timestamp as i64, 0)
                 .map(|t| t.with_timezone(&chrono::Local).format("%H:%M:%S").to_string())
                 .unwrap_or_default();
-            spans.push(Span::raw(format!(
-                " {} │ FreeBSD {} {} │ Interval {}s │ {when} │ up {}",
-                h.hostname,
-                h.os_release,
-                h.machine,
-                fmt_secs(self.hub.interval().as_secs_f64()),
-                uptime(s.snap.uptime)
-            )));
+            match &self.replay {
+                None => spans.push(Span::raw(format!(
+                    " {} │ FreeBSD {} {} │ Interval {}s │ {when} │ up {}",
+                    h.hostname,
+                    h.os_release,
+                    h.machine,
+                    fmt_secs(self.hub.interval().as_secs_f64()),
+                    uptime(s.snap.uptime)
+                ))),
+                Some(player) => {
+                    let date = chrono::DateTime::from_timestamp(s.snap.timestamp as i64, 0)
+                        .map(|t| t.with_timezone(&chrono::Local).format("%Y-%m-%d").to_string())
+                        .unwrap_or_default();
+                    spans.push(Span::raw(format!(
+                        " {} │ FreeBSD {} {} │ {date} {when} │ up {} ",
+                        h.hostname,
+                        h.os_release,
+                        h.machine,
+                        uptime(s.snap.uptime)
+                    )));
+                    let p = player.position();
+                    let state = if p.playing { "▶" } else { "❚❚" };
+                    spans.push(Span::styled(
+                        format!(" REPLAY {}/{} {state} {}x ", p.index + 1, p.len, fmt_secs(p.speed)),
+                        badge(Color::Magenta, Color::White),
+                    ));
+                }
+            }
             if h.demo {
                 spans.push(Span::styled(" DEMO DATA ", badge(Color::Red, Color::White)));
             }
@@ -718,7 +775,13 @@ impl App {
             ]));
         }
         let dim = DIM;
-        let keys = if self.detail.is_some() { " Esc=back ↑↓=scroll q=quit " } else { " h=help q=quit " };
+        let keys = if self.detail.is_some() {
+            " Esc=back ↑↓=scroll q=quit "
+        } else if self.replay.is_some() {
+            " p=play/pause ←→=step <>=seek +-=speed h=help q=quit "
+        } else {
+            " h=help q=quit "
+        };
         let mut spans = vec![Span::styled(keys, Style::default().add_modifier(Modifier::REVERSED))];
         for s in &self.status {
             spans.push(Span::styled(format!(" {s} │"), dim));
@@ -913,6 +976,13 @@ const HELP_PANELS: &[(&str, &str)] = &[
     ("h", "Help"),
 ];
 
+const HELP_REPLAY: &[(&str, &str)] = &[
+    ("p", "Play / pause"),
+    ("←→", "Step one sample"),
+    ("<>", "Seek a tenth"),
+    ("+-", "Faster / slower"),
+];
+
 const HELP_TOP: &[(&str, &str)] = &[
     ("3", "Sort by CPU"),
     ("4", "Sort by memory"),
@@ -941,7 +1011,7 @@ const HELP_MODES: &[(&str, &str)] = &[
 fn help_lines() -> Vec<Line<'static>> {
     // One column width for every grid so the columns line up across sections,
     // and keys right-aligned so a two-character key like ^L doesn't shift its "=".
-    let entries = || [HELP_PANELS, HELP_TOP, HELP_MODES].into_iter().flatten();
+    let entries = || [HELP_PANELS, HELP_TOP, HELP_MODES, HELP_REPLAY].into_iter().flatten();
     let key_width = entries().map(|(k, _)| k.chars().count()).max().unwrap_or(0);
     let width = entries().map(|(_, d)| key_width + 3 + d.chars().count()).max().unwrap_or(0) + 3;
     let grid = |entries: &[(&str, &str)]| -> Vec<Line<'static>> {
@@ -965,6 +1035,8 @@ fn help_lines() -> Vec<Line<'static>> {
     lines.extend(grid(HELP_TOP));
     lines.push(hdr("Anywhere".into()));
     lines.extend(grid(HELP_MODES));
+    lines.push(hdr("Playing a recording (jmon --replay FILE)".into()));
+    lines.extend(grid(HELP_REPLAY));
     lines.push(dim("Open panels at start: jmon --show cmdn (or JMON=cmdn, like nmon's NMON variable)"));
     lines
 }
@@ -2306,198 +2378,10 @@ fn superpages(s: &Sample) -> Vec<Line<'static>> {
     lines
 }
 
-#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-enum Level {
-    Ok,
-    Warning,
-    Danger,
-}
-
 /// nmon's verbose mode: each check with its value and an OK / WARNING /
 /// DANGER verdict, problems first.
 fn checks(s: &Sample) -> Vec<Line<'static>> {
-    let Some(r) = &s.rates else { return waiting() };
-    let snap = &s.snap;
-    let level = |v: f64, warn: f64, danger: f64| {
-        if v >= danger {
-            Level::Danger
-        } else if v >= warn {
-            Level::Warning
-        } else {
-            Level::Ok
-        }
-    };
-    let mut out: Vec<(Level, String)> = Vec::new();
-    let busy = 1.0 - r.cpu_total.idle;
-    out.push((level(busy, 0.8, 0.95), format!("CPU busy {:.0}% (warn 80, danger 95)", busy * 100.0)));
-    let ncpu = s.host.ncpu.max(1) as f64;
-    if snap.usable("runq") {
-        let rq = snap.runq.runnable as f64;
-        out.push((level(rq / ncpu, 1.0, 2.0), format!("Run queue {} for {} CPUs (warn > 1x, danger > 2x)", rq, ncpu)));
-    }
-    let m = &snap.memory;
-    if m.total > 0 {
-        let avail = (m.free + m.inactive) as f64 / m.total as f64;
-        out.push((level(1.0 - avail, 0.9, 0.95), format!("Memory available {:.1}% (free + inactive; warn < 10, danger < 5)", avail * 100.0)));
-    }
-    let (st, su): (u64, u64) = snap.swap.iter().fold((0, 0), |a, d| (a.0 + d.total, a.1 + d.used));
-    if st > 0 {
-        let used = su as f64 / st as f64;
-        out.push((level(used, 0.2, 0.5), format!("Swap used {:.1}% (warn 20, danger 50)", used * 100.0)));
-    }
-    if r.vm.swap_pages_out > 0.0 {
-        out.push((Level::Warning, format!("Swapping out {:.0} pages/s", r.vm.swap_pages_out)));
-    }
-    for (d, dr) in snap.disks.iter().zip(&r.disks) {
-        out.push((level(dr.busy, 0.7, 0.9), format!("Disk {} busy {:.0}% (warn 70, danger 90)", d.name, dr.busy * 100.0)));
-        let lat = dr.read_ms.max(dr.write_ms);
-        if lat > 0.0 {
-            out.push((level(lat, 20.0, 50.0), format!("Disk {} latency {:.1} ms (warn 20, danger 50)", d.name, lat)));
-        }
-    }
-    for f in &snap.filesystems {
-        let total = (f.used() + f.avail).max(1) as f64;
-        let used = f.used() as f64 / total;
-        out.push((level(used, 0.85, 0.95), format!("Filesystem {} {:.0}% full (warn 85, danger 95)", f.mountpoint, used * 100.0)));
-    }
-    for (n, nr) in snap.nets.iter().zip(&r.nets) {
-        if nr.errors_ps > 0.0 || nr.drops_ps > 0.0 {
-            out.push((Level::Warning, format!("Interface {}: {:.1} errors/s, {:.1} drops/s", n.name, nr.errors_ps, nr.drops_ps)));
-        }
-    }
-    if let Some(t) = r.tcp
-        && t.segs_sent >= 10.0
-    {
-        let pct = t.retransmits / t.segs_sent;
-        out.push((level(pct, 0.01, 0.05), format!("TCP retransmits {:.2}% of segments sent (warn 1, danger 5)", pct * 100.0)));
-        if t.listen_drops > 0.0 {
-            out.push((Level::Warning, format!("TCP listen-queue overflows {:.1}/s", t.listen_drops)));
-        }
-    }
-    let sn = &snap.sensors;
-    if let Some(hot) = sn.cpu_temps.iter().copied().reduce(f64::max) {
-        let lv = match temp_color(hot, sn.cpu_tjmax) {
-            C_SYS => Level::Danger,
-            C_WRITE => Level::Warning,
-            _ => Level::Ok,
-        };
-        out.push((lv, format!("CPU temperature {hot:.0} °C")));
-    }
-    if let Some(b) = &sn.battery
-        && !b.ac_online
-    {
-        out.push((level(1.0 - b.life / 100.0, 0.8, 0.9), format!("Battery {:.0}% and discharging", b.life)));
-    }
-    if let Some(z) = &snap.zfs {
-        for p in &z.pools {
-            let lv = if p.health == "ONLINE" { Level::Ok } else { Level::Danger };
-            out.push((lv, format!("ZFS pool {} {}", p.name, p.health)));
-            if p.size > 0 {
-                let cap = p.allocated as f64 / p.size as f64;
-                out.push((level(cap, 0.8, 0.9), format!("ZFS pool {} {:.0}% allocated (warn 80, danger 90)", p.name, cap * 100.0)));
-            }
-            let Some(st) = &p.status else { continue };
-            if st.data_errors > 0 {
-                out.push((Level::Danger, format!("ZFS pool {} has {} permanent data errors", p.name, st.data_errors)));
-            }
-            for v in &st.vdevs {
-                if !v.healthy() {
-                    out.push((Level::Danger, format!("ZFS device {} ({}) {}", v.name, p.name, v.state)));
-                } else if v.errors() > 0 {
-                    out.push((
-                        Level::Warning,
-                        format!(
-                            "ZFS device {} ({}): {} read, {} write, {} checksum errors",
-                            v.name, p.name, v.read_errors, v.write_errors, v.checksum_errors
-                        ),
-                    ));
-                }
-            }
-            // Leaf devices only: a mirror's or raidz's line averages its disks.
-            for io in p.iostat.iter().flatten() {
-                if !st.vdevs.iter().any(|v| v.name == io.name && v.slow_ios.is_some()) || io.read_ops + io.write_ops < 1.0 {
-                    continue;
-                }
-                let (total, disk) = if io.read_wait.unwrap_or(0.0) >= io.write_wait.unwrap_or(0.0) {
-                    (io.read_wait.unwrap_or(0.0), io.read_disk_wait.unwrap_or(0.0))
-                } else {
-                    (io.write_wait.unwrap_or(0.0), io.write_disk_wait.unwrap_or(0.0))
-                };
-                let (total, disk) = (total * 1000.0, disk * 1000.0);
-                out.push((
-                    level(total, 20.0, 50.0),
-                    format!(
-                        "ZFS device {} ({}) wait {:.1} ms: {:.1} on the device, {:.1} queued (warn 20, danger 50)",
-                        io.name,
-                        p.name,
-                        total,
-                        disk,
-                        (total - disk).max(0.0)
-                    ),
-                ));
-            }
-            if let Some(sc) = &st.scan {
-                if sc.state == "scanning" && sc.function == "resilver" {
-                    out.push((Level::Warning, format!("ZFS pool {} resilvering, {:.1}% done", p.name, sc.progress() * 100.0)));
-                } else if sc.errors > 0 {
-                    out.push((Level::Warning, format!("ZFS pool {} {} found {} errors", p.name, sc.function, sc.errors)));
-                }
-            }
-        }
-    }
-    for j in &snap.jails {
-        for rule in &j.rules {
-            if let Some(used) = rule.used(j) {
-                out.push((
-                    level(used, 0.8, 0.95),
-                    format!("Jail {} {} {:.0}% of its {} limit (warn 80, danger 95)", j.name, rule.resource, used * 100.0, rule.action),
-                ));
-            }
-        }
-    }
-    for l in &snap.limits {
-        let used = l.used as f64 / l.limit.max(1) as f64;
-        out.push((
-            level(used, 0.8, 0.95),
-            format!("Kernel {} {:.0}% of {} (warn 80, danger 95)", l.name, used * 100.0, l.sysctl),
-        ));
-    }
-    for (z, zr) in snap.zones.iter().zip(&r.zones) {
-        if z.limit == 0 || z.routinely_full() {
-            continue;
-        }
-        let used = z.used as f64 / z.limit as f64;
-        if zr.fails > 0.0 || zr.sleeps > 0.0 {
-            out.push((
-                Level::Danger,
-                format!(
-                    "Kernel zone {} at {:.0}% of its limit: {:.1} failed and {:.1} waiting allocations/s",
-                    z.name,
-                    used * 100.0,
-                    zr.fails,
-                    zr.sleeps
-                ),
-            ));
-        } else if used >= 0.5 {
-            out.push((level(used, 0.8, 0.95), format!("Kernel zone {} {:.0}% of its limit (warn 80, danger 95)", z.name, used * 100.0)));
-        }
-    }
-    if let Some(n) = &r.nfs
-        && (n.client_retries > 0.0 || n.client_timeouts > 0.0)
-    {
-        out.push((Level::Warning, format!("NFS client: {:.1} retries/s, {:.1} timeouts/s", n.client_retries, n.client_timeouts)));
-    }
-    for c in &snap.collectors {
-        let what = match c.state {
-            Availability::Denied => "permission denied",
-            Availability::Failed => "failed",
-            Availability::Stale => "stale",
-            _ => continue,
-        };
-        let detail = c.detail.as_deref().map(|d| format!(": {d}")).unwrap_or_default();
-        out.push((Level::Warning, format!("Collector {} {what}{detail}", c.name)));
-    }
-    out.sort_by_key(|(lv, _)| std::cmp::Reverse(*lv));
+    let Some(out) = crate::checks::evaluate(s) else { return waiting() };
     let problems = out.iter().filter(|(lv, _)| *lv != Level::Ok).count();
     let mut lines = vec![hdr(if problems == 0 {
         format!("All {} checks OK", out.len())
@@ -2557,7 +2441,7 @@ mod tests {
         let text = |l: &Line| l.spans.iter().map(|s| s.content.to_string()).collect::<String>();
         let rows: Vec<String> = help_lines().iter().map(text).filter(|t| t.starts_with("  ")).collect();
         // The "=" after each key is at the same offset in every column.
-        let starts = |r: &String| -> Vec<usize> { r.char_indices().filter(|&(_, c)| c == '=').map(|(i, _)| i).collect() };
+        let starts = |r: &String| -> Vec<usize> { r.chars().enumerate().filter(|&(_, c)| c == '=').map(|(i, _)| i).collect() };
         let first = starts(&rows[0]);
         assert_eq!(first.len(), 3);
         for r in &rows {
@@ -2758,6 +2642,51 @@ mod render_tests {
         assert!(checks.iter().any(|l| l.starts_with("DANGER") && l.contains("ZFS device nda0p3 (zroot) FAULTED")));
         assert!(checks.iter().any(|l| l.starts_with("WARNING") && l.contains("ada0p3 (zroot): 0 read, 0 write, 7 checksum")));
         assert!(checks.iter().any(|l| l.starts_with("DANGER") && l.contains("2 permanent data errors")));
+    }
+
+    #[test]
+    fn replay_keys_drive_the_player() {
+        use std::io::Write;
+        let mut c = Collector::new().unwrap();
+        let path = std::env::temp_dir().join(format!("jmon-tui-replay-{}.jsonl", std::process::id()));
+        let mut f = std::fs::File::create(&path).unwrap();
+        let mut prev = c.collect();
+        for i in 0..5u64 {
+            let mut snap = c.collect();
+            snap.timestamp = 1_800_000_000.0 + 3600.0 * i as f64;
+            serde_json::to_writer(&mut f, &Sample::derive(i + 1, c.host(), Some(&prev), snap.clone())).unwrap();
+            f.write_all(b"
+").unwrap();
+            prev = snap;
+        }
+        drop(f);
+        let hub = Hub::new(Duration::from_secs(1), 0);
+        let (player, thread) = replay::spawn(hub.clone(), replay::Recording::open(&path).unwrap()).unwrap();
+        let mut app = App::new(hub.clone(), "t", vec![], LogRing::default());
+        app.replay = Some(player);
+        let seq = |hub: &Hub, want: u64| {
+            let t = Instant::now();
+            while hub.latest().is_none_or(|s| s.seq != want) {
+                assert!(t.elapsed() < Duration::from_secs(5), "never reached {want}");
+                std::thread::sleep(Duration::from_millis(5));
+            }
+        };
+        seq(&hub, 1);
+        // Samples an hour apart: it waits, so step by hand.
+        app.key(KeyCode::Right, KeyModifiers::NONE);
+        app.key(KeyCode::Right, KeyModifiers::NONE);
+        seq(&hub, 3);
+        let mut t = Terminal::new(TestBackend::new(160, 10)).unwrap();
+        t.draw(|f| app.draw(f, hub.latest().as_deref())).unwrap();
+        let top: String = (0..160).map(|x| t.backend().buffer()[(x, 0)].symbol().to_string()).collect();
+        assert!(top.contains("REPLAY 3/5 ❚❚ 1x"), "{top}");
+        // The detail screen reads the live system, so it stays shut.
+        app.key(KeyCode::Enter, KeyModifiers::NONE);
+        assert!(app.input.is_none() && app.detail.is_none());
+        assert!(!app.key(KeyCode::Char('q'), KeyModifiers::NONE));
+        hub.request_stop();
+        thread.join().unwrap();
+        std::fs::remove_file(path).unwrap();
     }
 
     #[test]

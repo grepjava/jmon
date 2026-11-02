@@ -4,7 +4,7 @@
 use crate::metrics::{self, Families};
 use crate::model::*;
 use crate::platform::Collector;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
@@ -14,7 +14,7 @@ use std::time::{Duration, Instant};
 use tracing::warn;
 
 /// CPU time split as fractions of the interval (0.0..=1.0).
-#[derive(Debug, Clone, Copy, Default, Serialize)]
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
 pub struct CpuUtil {
     pub user: f64,
     pub nice: f64,
@@ -49,7 +49,7 @@ impl CpuUtil {
     }
 }
 
-#[derive(Debug, Clone, Copy, Default, Serialize)]
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
 pub struct DiskRate {
     pub read_bps: f64,
     pub write_bps: f64,
@@ -62,7 +62,7 @@ pub struct DiskRate {
     pub write_ms: f64,
 }
 
-#[derive(Debug, Clone, Copy, Default, Serialize)]
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
 pub struct NetRate {
     pub rx_bps: f64,
     pub tx_bps: f64,
@@ -72,7 +72,7 @@ pub struct NetRate {
     pub drops_ps: f64,
 }
 
-#[derive(Debug, Clone, Copy, Default, Serialize)]
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
 pub struct VmRates {
     pub context_switches: f64,
     pub interrupts: f64,
@@ -97,7 +97,7 @@ pub struct VmRates {
     pub pageout_scanned: f64,
 }
 
-#[derive(Debug, Clone, Copy, Default, Serialize)]
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
 pub struct SuperpageRates {
     pub mappings: f64,
     pub promotions: f64,
@@ -105,7 +105,7 @@ pub struct SuperpageRates {
     pub failures: f64,
 }
 
-#[derive(Debug, Clone, Default, Serialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct NfsRates {
     /// Per operation, busiest first.
     pub client_ops: Vec<(String, f64)>,
@@ -118,7 +118,7 @@ pub struct NfsRates {
 
 /// Per-second rates over the last interval. Vectors are index-aligned with
 /// the corresponding vectors in the current snapshot.
-#[derive(Debug, Clone, Default, Serialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Rates {
     pub interval: f64,
     pub cpu_total: CpuUtil,
@@ -151,14 +151,14 @@ pub struct Rates {
     pub zones: Vec<ZoneRate>,
 }
 
-#[derive(Debug, Clone, Copy, Default, Serialize)]
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
 pub struct ZoneRate {
     pub fails: f64,
     pub sleeps: f64,
 }
 
 /// Resource use summed over a group of processes (a jail or a VM).
-#[derive(Debug, Clone, Default, Serialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct GroupRate {
     pub id: i64,
     pub name: String,
@@ -169,7 +169,7 @@ pub struct GroupRate {
     pub io: f64,
 }
 
-#[derive(Debug, Clone, Copy, Default, Serialize)]
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
 pub struct TcpRates {
     pub segs_sent: f64,
     pub segs_received: f64,
@@ -179,7 +179,7 @@ pub struct TcpRates {
     pub conn_attempts: f64,
 }
 
-#[derive(Debug, Clone, Copy, Default, Serialize)]
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
 pub struct UdpRates {
     pub datagrams_in: f64,
     pub datagrams_out: f64,
@@ -188,7 +188,7 @@ pub struct UdpRates {
     pub full_socket_buffers: f64,
 }
 
-#[derive(Debug, Clone, Default, Serialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ZfsRates {
     /// ARC hit ratio over the interval, if there were any lookups.
     pub arc_hit_ratio: Option<f64>,
@@ -197,7 +197,7 @@ pub struct ZfsRates {
     pub pools: Vec<PoolRate>,
 }
 
-#[derive(Debug, Clone, Copy, Default, Serialize)]
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
 pub struct PoolRate {
     pub read_bps: f64,
     pub write_bps: f64,
@@ -205,7 +205,7 @@ pub struct PoolRate {
     pub write_iops: f64,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct Sample {
     pub seq: u64,
     pub host: Arc<HostInfo>,
@@ -618,7 +618,7 @@ impl Hub {
         self.latest.read().unwrap().clone()
     }
 
-    fn publish(&self, s: Arc<Sample>) {
+    pub(crate) fn publish(&self, s: Arc<Sample>) {
         *self.latest.write().unwrap() = Some(s);
     }
 
@@ -723,6 +723,20 @@ pub fn spawn(hub: Arc<Hub>, mut collector: Collector, mut sinks: Vec<Box<dyn Sin
 mod tests {
     use super::*;
     use crate::metrics::M;
+
+    /// A recorded sample reads back as it was written, for --replay.
+    #[cfg(not(target_os = "freebsd"))]
+    #[test]
+    fn samples_round_trip_through_json() {
+        let mut c = crate::platform::Collector::new().unwrap();
+        let first = c.collect();
+        std::thread::sleep(Duration::from_millis(20));
+        let s = Sample::derive(7, c.host(), Some(&first), c.collect());
+        let json = serde_json::to_string(&s).unwrap();
+        let back: Sample = serde_json::from_str(&json).unwrap();
+        assert_eq!(serde_json::to_string(&back).unwrap(), json);
+        assert_eq!((back.seq, back.snap.processes[0].state), (7, s.snap.processes[0].state));
+    }
 
     fn test_host() -> Arc<HostInfo> {
         Arc::new(HostInfo {

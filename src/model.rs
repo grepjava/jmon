@@ -3,10 +3,10 @@
 //! Collectors fill these with cumulative values exactly as the kernel reports
 //! them; rates and percentages are derived later in `sample`.
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::time::Instant;
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HostInfo {
     pub hostname: String,
     pub os_type: String,
@@ -21,7 +21,7 @@ pub struct HostInfo {
 }
 
 /// Cumulative CPU ticks for one logical CPU, in `kern.cp_times` order.
-#[derive(Debug, Clone, Copy, Default, Serialize)]
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
 pub struct CpuTicks {
     pub user: u64,
     pub nice: u64,
@@ -57,7 +57,7 @@ impl CpuTicks {
 }
 
 /// Physical memory by FreeBSD page queue, in bytes.
-#[derive(Debug, Clone, Default, Serialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Memory {
     pub total: u64,
     pub active: u64,
@@ -69,7 +69,7 @@ pub struct Memory {
     pub arc: Option<u64>,
 }
 
-#[derive(Debug, Clone, Default, Serialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct SwapDev {
     pub name: String,
     pub total: u64,
@@ -77,7 +77,7 @@ pub struct SwapDev {
 }
 
 /// Cumulative kernel event counters from `vm.stats`.
-#[derive(Debug, Clone, Copy, Default, Serialize)]
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
 pub struct VmCounters {
     pub context_switches: u64,
     pub interrupts: u64,
@@ -105,7 +105,7 @@ pub struct VmCounters {
 }
 
 /// Thread counts by scheduling state from vm.vmtotal (vmstat's r/b/w).
-#[derive(Debug, Clone, Copy, Default, Serialize)]
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
 pub struct RunQueue {
     pub runnable: u64,
     pub disk_wait: u64,
@@ -114,7 +114,7 @@ pub struct RunQueue {
 }
 
 /// Superpage (2 MB page) activity from vm.pmap.pde.
-#[derive(Debug, Clone, Copy, Default, Serialize)]
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
 pub struct Superpages {
     pub enabled: bool,
     pub mappings: u64,
@@ -124,7 +124,7 @@ pub struct Superpages {
 }
 
 /// Cumulative NFS operation counts, from nfsstat(1).
-#[derive(Debug, Clone, Default, Serialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Nfs {
     pub client_ops: Vec<(String, u64)>,
     pub client_requests: u64,
@@ -133,7 +133,7 @@ pub struct Nfs {
     pub server_ops: Vec<(String, u64)>,
 }
 
-#[derive(Debug, Clone, Default, Serialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Disk {
     pub name: String,
     pub read_bytes: u64,
@@ -147,7 +147,7 @@ pub struct Disk {
     pub queue: u64,
 }
 
-#[derive(Debug, Clone, Default, Serialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct NetIf {
     pub name: String,
     pub up: bool,
@@ -163,7 +163,7 @@ pub struct NetIf {
     pub tx_drops: u64,
 }
 
-#[derive(Debug, Clone, Default, Serialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Filesystem {
     pub device: String,
     pub mountpoint: String,
@@ -180,7 +180,7 @@ impl Filesystem {
     }
 }
 
-#[derive(Debug, Clone, Default, Serialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Process {
     pub pid: i32,
     pub ppid: i32,
@@ -191,7 +191,8 @@ pub struct Process {
     pub args: String,
     /// Jail ID; 0 for the host.
     pub jid: i32,
-    pub state: &'static str,
+    #[serde(deserialize_with = "interned::str")]
+    pub state: Name,
     pub threads: u32,
     /// Process start time in microseconds since the Unix epoch (disambiguates recycled PIDs).
     pub start_time: i64,
@@ -210,9 +211,10 @@ pub struct Process {
     pub major_faults: u64,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Snapshot {
-    #[serde(skip)]
+    /// When it was read; a replayed snapshot gets the time it was loaded.
+    #[serde(skip, default = "Instant::now")]
     pub taken: Instant,
     /// Wall clock, seconds since the Unix epoch.
     pub timestamp: f64,
@@ -249,11 +251,13 @@ pub struct Snapshot {
 }
 
 /// A kernel table and its limit.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct KernelLimit {
-    pub name: &'static str,
+    #[serde(deserialize_with = "interned::str")]
+    pub name: Name,
     /// The sysctl that sets the limit.
-    pub sysctl: &'static str,
+    #[serde(deserialize_with = "interned::str")]
+    pub sysctl: Name,
     pub used: u64,
     pub limit: u64,
     /// Whether the numbers are bytes rather than items.
@@ -261,7 +265,7 @@ pub struct KernelLimit {
 }
 
 /// One UMA zone, the kernel allocator for one kind of object.
-#[derive(Debug, Clone, Default, Serialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct UmaZone {
     pub name: String,
     pub size: u64,
@@ -290,7 +294,7 @@ impl UmaZone {
 /// Whether a collector's data in this snapshot can be trusted.
 // Only the FreeBSD collector can fail; the demo source is always ok.
 #[cfg_attr(not(target_os = "freebsd"), allow(dead_code))]
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Availability {
     Ok,
@@ -334,9 +338,10 @@ impl Availability {
     }
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CollectorStatus {
-    pub name: &'static str,
+    #[serde(deserialize_with = "interned::str")]
+    pub name: Name,
     pub state: Availability,
     /// The error, or for `partial` the fields that were unavailable.
     pub detail: Option<String>,
@@ -346,7 +351,7 @@ pub struct CollectorStatus {
     pub duration: f64,
 }
 
-#[derive(Debug, Clone, Default, Serialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Sensors {
     /// Per-CPU temperature in Celsius (needs coretemp or amdtemp loaded).
     pub cpu_temps: Vec<f64>,
@@ -360,19 +365,20 @@ pub struct Sensors {
     pub battery: Option<Battery>,
 }
 
-#[derive(Debug, Clone, Default, Serialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Battery {
     /// Remaining charge, percent.
     pub life: f64,
     /// Minutes remaining while discharging.
     pub minutes_left: Option<u64>,
-    pub state: &'static str,
+    #[serde(deserialize_with = "interned::str")]
+    pub state: Name,
     pub ac_online: bool,
 }
 
 /// Cumulative TCP counters from net.inet.tcp.stats plus current
 /// connection counts by state.
-#[derive(Debug, Clone, Default, Serialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Tcp {
     pub conn_attempts: u64,
     pub accepts: u64,
@@ -382,11 +388,12 @@ pub struct Tcp {
     pub retransmits: u64,
     pub listen_drops: u64,
     pub bad_checksums: u64,
+    #[serde(deserialize_with = "interned::pairs")]
     pub states: Vec<(&'static str, u64)>,
 }
 
 /// Cumulative UDP counters from net.inet.udp.stats.
-#[derive(Debug, Clone, Copy, Default, Serialize)]
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
 pub struct Udp {
     pub datagrams_in: u64,
     pub datagrams_out: u64,
@@ -395,7 +402,7 @@ pub struct Udp {
     pub full_socket_buffers: u64,
 }
 
-#[derive(Debug, Clone, Default, Serialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Jail {
     pub jid: i32,
     pub name: String,
@@ -414,7 +421,7 @@ impl Jail {
 }
 
 /// One rctl rule: `jail:<name>:<resource>:<action>=<amount>[/<per>]`.
-#[derive(Debug, Clone, Default, Serialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct RctlRule {
     pub resource: String,
     /// deny, log, devctl, sigkill, throttle, ...
@@ -443,7 +450,7 @@ pub fn racct_unit(resource: &str) -> LimitUnit {
     }
 }
 
-#[derive(Debug, Clone, Default, Serialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Zfs {
     pub arc_size: u64,
     pub arc_target: u64,
@@ -456,7 +463,7 @@ pub struct Zfs {
     pub pools: Vec<ZPool>,
 }
 
-#[derive(Debug, Clone, Default, Serialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ZPool {
     pub name: String,
     pub health: String,
@@ -478,7 +485,7 @@ pub struct ZPool {
 }
 
 /// One line of a `zpool iostat -vlq` report: averages over its interval.
-#[derive(Debug, Clone, Default, Serialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct VdevIo {
     pub name: String,
     /// Operations and bytes per second.
@@ -493,6 +500,7 @@ pub struct VdevIo {
     pub read_disk_wait: Option<f64>,
     pub write_disk_wait: Option<f64>,
     /// ZFS I/O queues: (name, pending, active).
+    #[serde(deserialize_with = "interned::triples")]
     pub queues: Vec<(&'static str, u64, u64)>,
 }
 
@@ -507,7 +515,7 @@ impl VdevIo {
     }
 }
 
-#[derive(Debug, Clone, Default, Serialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct PoolStatus {
     /// zpool status's explanation of a problem, and what to do about it.
     pub message: Option<String>,
@@ -520,7 +528,7 @@ pub struct PoolStatus {
     pub vdevs: Vec<Vdev>,
 }
 
-#[derive(Debug, Clone, Default, Serialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct PoolScan {
     /// "scrub", "resilver" or "error scrub".
     pub function: String,
@@ -556,13 +564,14 @@ impl PoolScan {
     }
 }
 
-#[derive(Debug, Clone, Default, Serialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Vdev {
     pub name: String,
     /// mirror, raidz2, disk, file, ...
     pub kind: String,
     /// Empty for the main devices, else special, dedup, logs, cache or spares.
-    pub group: &'static str,
+    #[serde(deserialize_with = "interned::str")]
+    pub group: Name,
     pub depth: u8,
     pub state: String,
     pub read_errors: u64,
@@ -770,5 +779,43 @@ mod tests {
         });
         assert!(!s.usable("runq"));
         assert!(s.usable("nfs"));
+    }
+}
+
+/// A fixed name or state. An alias because serde would otherwise take a
+/// `&'static str` field as borrowed from the input and refuse to read it.
+pub type Name = &'static str;
+
+/// Deserializes the `&'static str` fields (states, names) of a recorded
+/// sample. They come from a small fixed set, so each distinct string is
+/// leaked once and reused.
+mod interned {
+    use serde::{Deserialize, Deserializer};
+    use std::collections::HashSet;
+    use std::sync::{Mutex, OnceLock};
+
+    pub fn intern(s: &str) -> &'static str {
+        static SEEN: OnceLock<Mutex<HashSet<&'static str>>> = OnceLock::new();
+        let mut seen = SEEN.get_or_init(Default::default).lock().unwrap();
+        match seen.get(s) {
+            Some(&t) => t,
+            None => {
+                let t: &'static str = Box::leak(s.to_owned().into_boxed_str());
+                seen.insert(t);
+                t
+            }
+        }
+    }
+
+    pub fn str<'de, D: Deserializer<'de>>(d: D) -> Result<&'static str, D::Error> {
+        Ok(intern(&String::deserialize(d)?))
+    }
+
+    pub fn pairs<'de, D: Deserializer<'de>>(d: D) -> Result<Vec<(&'static str, u64)>, D::Error> {
+        Ok(Vec::<(String, u64)>::deserialize(d)?.iter().map(|(s, n)| (intern(s), *n)).collect())
+    }
+
+    pub fn triples<'de, D: Deserializer<'de>>(d: D) -> Result<Vec<(&'static str, u64, u64)>, D::Error> {
+        Ok(Vec::<(String, u64, u64)>::deserialize(d)?.iter().map(|(s, a, b)| (intern(s), *a, *b)).collect())
     }
 }

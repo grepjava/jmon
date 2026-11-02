@@ -47,6 +47,8 @@ jmon -d --otlp-endpoint https://otel:4317 --otlp-ca ca.pem
 jmon -d --prometheus 0.0.0.0:9464          # headless agent, scrape endpoint
 jmon -f -s 60 --rotate --record-keep 30    # daily .nmon files, kept 30 days
 jmon --once                                # one sample as JSON
+jmon -d --incident-dir /var/log/jmon/incidents   # save the minutes around each lasting problem
+jmon --replay host_incident_261102_073409.jsonl  # play a JSON Lines recording back
 jmon --disk-group mirror=ada0,ada1         # disk groups (g key, DG* in nmon files)
 ```
 
@@ -70,6 +72,14 @@ In the process list:
 - `u` filters by user.
 - `/` searches by command, arguments, user or jail.
 - `Enter` asks for a PID (the first process in the list by default) and opens its detail screen: each thread's state, wait channel or blocking lock, CPU, context switches, faults and I/O; open descriptors by type against the `openfiles` limit; the executable, working directory and resource limits. It is read only while open, and `Esc` goes back. Open files of other users' processes need root.
+
+Playing a recording (`--replay`): `p` or space plays and pauses, `Left` and `Right` step one sample, `<` and `>` jump a tenth of the recording, `+` and `-` double or halve the speed. The other panels and keys work as they do live; the process detail screen does not, since it reads the live system.
+
+## Incidents and replay
+
+Recordings in JSON Lines (`--record-format jsonl`) can be played back on the screen with `jmon --replay FILE`, at the recorded pace or faster, on any system.
+
+With `--incident-dir DIR`, jmon keeps the last five minutes of samples in memory. When a check from the Checks panel stays at warning or danger for 30 seconds, it writes those minutes and everything after to `DIR/<host>_incident_<YYMMDD_HHMMSS>.jsonl`, until the problems have been gone for five minutes, and logs what started it. The times are set with `--incident-before`, `--incident-sustain` and `--incident-after` (seconds). So a problem that came and went at 3 a.m. can be replayed with what led up to it.
 
 Anywhere:
 - `.` hides idle CPUs, disks, interfaces and processes.
