@@ -400,6 +400,47 @@ pub struct Jail {
     pub jid: i32,
     pub name: String,
     pub hostname: String,
+    /// The kernel's resource accounting (RACCT) for the jail, as rctl -u
+    /// shows it; `None` when it could not be read (see the rctl collector).
+    pub racct: Option<Vec<(String, u64)>>,
+    /// rctl rules on the jail.
+    pub rules: Vec<RctlRule>,
+}
+
+impl Jail {
+    pub fn usage(&self, resource: &str) -> Option<u64> {
+        self.racct.as_ref()?.iter().find(|(r, _)| r == resource).map(|(_, v)| *v)
+    }
+}
+
+/// One rctl rule: `jail:<name>:<resource>:<action>=<amount>[/<per>]`.
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct RctlRule {
+    pub resource: String,
+    /// deny, log, devctl, sigkill, throttle, ...
+    pub action: String,
+    pub amount: u64,
+    /// What the amount applies to: "jail" for the jail as a whole, or
+    /// "process" or "user" for each one in it.
+    pub per: String,
+}
+
+impl RctlRule {
+    /// Fraction of a jail-wide limit in use; `None` for per-process or
+    /// per-user rules, which jail totals cannot be compared with.
+    pub fn used(&self, jail: &Jail) -> Option<f64> {
+        (self.per == "jail" && self.amount > 0).then(|| jail.usage(&self.resource).map(|u| u as f64 / self.amount as f64))?
+    }
+}
+
+/// How an RACCT resource is counted, for display.
+pub fn racct_unit(resource: &str) -> LimitUnit {
+    match resource {
+        "cputime" | "wallclock" => LimitUnit::Seconds,
+        "datasize" | "stacksize" | "coredumpsize" | "memoryuse" | "memorylocked" | "vmemoryuse" | "swapuse" | "shmsize"
+        | "msgqsize" | "readbps" | "writebps" => LimitUnit::Bytes,
+        _ => LimitUnit::Count,
+    }
 }
 
 #[derive(Debug, Clone, Default, Serialize)]

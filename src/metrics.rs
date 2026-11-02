@@ -138,6 +138,9 @@ catalog! {
     JailMem => "freebsd.jail.memory.usage", "By", UpDown, "Resident memory of each jail's processes.";
     JailProcs => "freebsd.jail.process.count", "{process}", UpDown, "Processes in each jail.";
     JailIo => "freebsd.jail.io.operations", "{operation}", Gauge, "Block I/O operations per second of each jail's processes.";
+    JailRacctCpu => "freebsd.jail.racct.cpu.utilization", "1", Gauge, "CPU used by each jail by kernel accounting (RACCT), as a fraction of one CPU.";
+    JailRacctMem => "freebsd.jail.racct.memory.usage", "By", UpDown, "Resident memory of each jail by kernel accounting (RACCT).";
+    JailLimit => "freebsd.jail.limit.utilization", "1", Gauge, "Fraction of each jail-wide rctl limit in use.";
     VmCpu => "freebsd.bhyve.cpu.utilization", "1", Gauge, "CPU used by each bhyve VM, as a fraction of one CPU.";
     VmMem => "freebsd.bhyve.memory.usage", "By", UpDown, "Resident memory of each bhyve VM process.";
     ArcTarget => "freebsd.zfs.arc.target_size", "By", UpDown, "ZFS ARC target size (c).";
@@ -458,6 +461,23 @@ pub fn collect(s: &Sample, top_procs: usize, stats: &SelfStats) -> Families {
         }
     }
 
+    for j in &snap.jails {
+        let jail = || vec![("freebsd.jail.id", Val::Int(j.jid as i64)), ("freebsd.jail.name", Val::from(j.name.clone()))];
+        if let Some(p) = j.usage("pcpu") {
+            b.add(M::JailRacctCpu, jail(), p as f64 / 100.0);
+        }
+        if let Some(m) = j.usage("memoryuse") {
+            b.add(M::JailRacctMem, jail(), m as f64);
+        }
+        for rule in &j.rules {
+            if let Some(used) = rule.used(j) {
+                let mut a = jail();
+                a.push(("freebsd.rctl.resource", Val::from(rule.resource.clone())));
+                a.push(("freebsd.rctl.action", Val::from(rule.action.clone())));
+                b.add(M::JailLimit, a, used);
+            }
+        }
+    }
     for l in &snap.limits {
         b.add(M::KernelUtilization, vec![("freebsd.kernel.resource", Val::from(l.name))], l.used as f64 / l.limit.max(1) as f64);
     }

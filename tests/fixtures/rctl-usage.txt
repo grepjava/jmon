@@ -1,0 +1,1 @@
+cputime=0,datasize=4096,stacksize=0,coredumpsize=0,memoryuse=1986560,memorylocked=0,maxproc=1,openfiles=0,vmemoryuse=14422016,pseudoterminals=0,swapuse=24395776,nthr=1,msgqqueued=0,msgqsize=0,nmsgq=0,nsem=0,nsemop=0,nshm=0,shmsize=0,wallclock=1,pcpu=0,readbps=0,writebps=0,readiops=0,writeiops=0

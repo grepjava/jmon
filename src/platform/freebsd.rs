@@ -511,7 +511,10 @@ impl Collector {
         let tcp = self.run("tcp", |c| tcp(&c.mibs));
         let udp = self.run("udp", |c| udp(&c.mibs));
         let sensors = self.run("sensors", Collector::sensors).unwrap_or_default();
-        let jails = self.run("jails", |_| jails()).unwrap_or_default();
+        let mut jails = self.run("jails", |_| jails()).unwrap_or_default();
+        if !jails.is_empty() {
+            self.run("rctl", |_| rctl_jails(&mut jails));
+        }
         let zfs = self.zfs();
         let nprocs = processes.len();
         let limits = self.run_partial("limits", |_| Ok(kernel_limits(nprocs))).unwrap_or_default();
@@ -1540,9 +1543,81 @@ fn jails() -> Result<Vec<Jail>> {
             return Err(e.into());
         }
         lastjid = r;
-        out.push(Jail { jid, name: cstr_bytes(&name), hostname: cstr_bytes(&host) });
+        out.push(Jail { jid, name: cstr_bytes(&name), hostname: cstr_bytes(&host), ..Default::default() });
     }
     Ok(out)
+}
+
+// rctl(2): not in the libc crate.
+unsafe extern "C" {
+    fn rctl_get_racct(inbuf: *const libc::c_char, inlen: libc::size_t, outbuf: *mut libc::c_char, outlen: libc::size_t) -> libc::c_int;
+    fn rctl_get_rules(inbuf: *const libc::c_char, inlen: libc::size_t, outbuf: *mut libc::c_char, outlen: libc::size_t) -> libc::c_int;
+}
+
+type RctlCall = unsafe extern "C" fn(*const libc::c_char, libc::size_t, *mut libc::c_char, libc::size_t) -> libc::c_int;
+
+fn rctl_call(call: RctlCall, filter: &str) -> io::Result<String> {
+    let input = CString::new(filter)?;
+    let mut size = 4096;
+    loop {
+        let mut out = vec![0u8; size];
+        let r = unsafe { call(input.as_ptr(), input.as_bytes_with_nul().len(), out.as_mut_ptr().cast(), out.len()) };
+        if r == 0 {
+            return Ok(cstr_bytes(&out));
+        }
+        let e = io::Error::last_os_error();
+        match e.raw_os_error() {
+            Some(libc::ERANGE) if size < 1 << 22 => size *= 4,
+            Some(libc::ENOSYS) => {
+                let msg = "RACCT is off: set kern.racct.enable=1 in /boot/loader.conf and reboot";
+                return Err(io::Error::new(io::ErrorKind::Unsupported, msg));
+            }
+            _ => return Err(e),
+        }
+    }
+}
+
+/// Each jail's RACCT usage and rctl rules. Reading them needs root.
+fn rctl_jails(jails: &mut [Jail]) -> Result<()> {
+    for j in jails.iter_mut() {
+        let filter = format!("jail:{}", j.name);
+        let read = rctl_call(rctl_get_racct, &filter).and_then(|u| Ok((u, rctl_call(rctl_get_rules, &filter)?)));
+        match read {
+            Ok((usage, rules)) => {
+                j.racct = Some(parse_racct(&usage));
+                j.rules = parse_rctl_rules(&rules);
+            }
+            // A jail can go away between listing it and asking about it.
+            Err(e) if !matches!(e.kind(), io::ErrorKind::PermissionDenied | io::ErrorKind::Unsupported) => {}
+            Err(e) => return Err(anyhow::Error::from(e).context("rctl")),
+        }
+    }
+    Ok(())
+}
+
+/// `cputime=3778,datasize=2105344,...`
+pub(crate) fn parse_racct(text: &str) -> Vec<(String, u64)> {
+    text.split(',')
+        .filter_map(|kv| {
+            let (k, v) = kv.split_once('=')?;
+            Some((k.trim().to_string(), v.trim().parse().ok()?))
+        })
+        .collect()
+}
+
+/// `jail:<name>:<resource>:<action>=<amount>[/<per>],...`; jail names may
+/// contain dots but not colons.
+pub(crate) fn parse_rctl_rules(text: &str) -> Vec<RctlRule> {
+    text.split(',')
+        .filter_map(|rule| {
+            let rest = rule.trim().strip_prefix("jail:")?;
+            let mut parts = rest.rsplitn(3, ':');
+            let (action, amount) = parts.next()?.split_once('=')?;
+            let resource = parts.next()?;
+            let (amount, per) = amount.split_once('/').unwrap_or((amount, "jail"));
+            Some(RctlRule { resource: resource.into(), action: action.into(), amount: amount.parse().ok()?, per: per.into() })
+        })
+        .collect()
 }
 
 // ---------------------------------------------------------------------------
@@ -2249,6 +2324,25 @@ mod fixtures {
         assert!(exact * 10 >= zones.len() * 8, "{exact} of {}", zones.len());
         let mbuf = zones.iter().find(|z| z.name == "mbuf_cluster").unwrap();
         assert_eq!((mbuf.size, mbuf.limit), (2048, 125763));
+    }
+
+    /// rctl -u and rctl output for a jail with one sleeping process, joined
+    /// with commas as the kernel returns them.
+    #[test]
+    fn rctl_output() {
+        let usage = String::from_utf8(read("rctl-usage.txt")).unwrap();
+        let racct = parse_racct(usage.trim());
+        assert_eq!(racct.len(), 25);
+        assert_eq!(racct[0].0, "cputime");
+        assert!(racct.iter().any(|(r, v)| r == "memoryuse" && *v > 1 << 20));
+        assert!(racct.iter().any(|(r, v)| r == "maxproc" && *v == 1));
+        let rules = parse_rctl_rules(String::from_utf8(read("rctl-rules.txt")).unwrap().trim());
+        let summary: Vec<(&str, &str, u64, &str)> =
+            rules.iter().map(|r| (r.resource.as_str(), r.action.as_str(), r.amount, r.per.as_str())).collect();
+        assert_eq!(
+            summary,
+            [("openfiles", "deny", 10, "process"), ("memoryuse", "sigkill", 134217728, "jail"), ("maxproc", "deny", 64, "jail")]
+        );
     }
 
     #[test]

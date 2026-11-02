@@ -1,0 +1,1 @@
+jail:jmontest:openfiles:deny=10/process,jail:jmontest:memoryuse:sigkill=134217728,jail:jmontest:maxproc:deny=64

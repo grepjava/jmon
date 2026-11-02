@@ -11,7 +11,7 @@ jmon is a performance monitor for FreeBSD modelled on [nmon](https://nmon.source
   - filesystems
   - ZFS ARC and pools, with each pool's devices, their read/write/checksum errors and slow I/Os, and scrub or resilver progress (OpenZFS 2.3 or later), and per-device latency split into time on the device and time queued in ZFS, with queue depths
   - kernel limits: open files, sockets, vnodes, processes, pipe memory and every limited kernel allocator zone (mbufs, mbuf clusters, pf states, ...) against its limit, and allocations failing now
-  - jails and bhyve VMs
+  - jails and bhyve VMs; with RACCT enabled (`kern.racct.enable=1`) and jmon running as root, also each jail's kernel accounting (CPU, memory, swap, processes, threads, open files, I/O) and how much of each rctl limit it uses
   - temperatures, CPU clock and battery
   - top processes, with full command lines, I/O and a per-user filter
   - one process in detail: its threads with wait channels and context switches, open files against the limit, and resource limits
@@ -141,6 +141,7 @@ The service runs as `nobody` under daemon(8), which restarts it if it exits. `se
 | `freebsd.zfs.pool.{usage,fragmentation,health,io,operations}` | | `zfs.pool.name`, `zfs.pool.state` / `.health`, `disk.io.direction` |
 | `freebsd.zfs.pool.data_errors`, `freebsd.zfs.pool.scan.{progress,errors}` | {error}, 1, {error} | `zfs.pool.name`, `zfs.scan.function`, `zfs.scan.state` |
 | `freebsd.zfs.vdev.{health,errors,slow_ios}` | | `zfs.pool.name`, `zfs.vdev.{name,type,group,state}`, `error.type` |
+| `freebsd.jail.racct.{cpu.utilization,memory.usage}`, `freebsd.jail.limit.utilization` | 1, By, 1 | `freebsd.jail.id`, `freebsd.jail.name`; `freebsd.rctl.resource`, `freebsd.rctl.action` |
 | `freebsd.kernel.limit.utilization` | 1 | `freebsd.kernel.resource` (open files, sockets, vnodes, pipe KVA, processes, `uma:<zone>`) |
 | `freebsd.kernel.uma.{usage,limit,failures,sleeps}` | | `freebsd.uma.zone`; usage and limit for limited zones, failures and sleeps for zones that have had any |
 | `freebsd.zfs.vdev.wait`, `freebsd.zfs.vdev.queue` | s, {operation} | `zfs.pool.name`, `zfs.vdev.name`, `disk.io.direction`, `zfs.wait.type` (total, disk); `zfs.queue`, `zfs.queue.state` (pending, active) |

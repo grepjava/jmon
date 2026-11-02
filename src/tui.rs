@@ -1877,6 +1877,79 @@ fn jails(s: &Sample, v: &View) -> Vec<Line<'static>> {
         lines.push(hdr(format!("{:>5} {:<16} {:>6} {:>7} {:>9} {:>8}", "PID", "bhyve VM", "Procs", "%CPU", "RES", "IO/s")));
         group_rows(&mut lines, &r.vms, |_| String::new(), v.busy_only);
     }
+    lines.extend(jail_racct(&s.snap));
+    lines
+}
+
+fn racct_value(resource: &str, v: u64) -> String {
+    match crate::model::racct_unit(resource) {
+        LimitUnit::Bytes => human(v),
+        LimitUnit::Seconds => format!("{v}s"),
+        LimitUnit::Count if resource == "pcpu" => format!("{v}%"),
+        LimitUnit::Count => v.to_string(),
+    }
+}
+
+/// The kernel's own accounting per jail (RACCT), which also counts what the
+/// process totals above cannot see, such as swap and threads, and each
+/// rctl limit with how much of it is used.
+fn jail_racct(snap: &Snapshot) -> Vec<Line<'static>> {
+    let jails: Vec<_> = snap.jails.iter().filter(|j| j.racct.is_some()).collect();
+    if jails.is_empty() {
+        return match snap.collectors.iter().find(|c| c.name == "rctl").filter(|c| !c.state.usable()) {
+            Some(c) => {
+                let hint = if c.state == Availability::Denied { " (needs root)" } else { "" };
+                let detail = c.detail.as_deref().unwrap_or("");
+                vec![dim(format!("Kernel accounting (RACCT) {}{hint}: {detail}", c.state.as_str()))]
+            }
+            None => Vec::new(),
+        };
+    }
+    let mut lines = vec![hdr(format!(
+        "{:<16} {:>6} {:>8} {:>8} {:>6} {:>7} {:>6} {:>9} {:>9}   (kernel accounting, RACCT)",
+        "Jail", "%CPU", "Memory", "Swap", "Procs", "Threads", "Files", "Read/s", "Write/s"
+    ))];
+    let u = |j: &crate::model::Jail, r: &str| j.usage(r).unwrap_or(0);
+    for j in &jails {
+        lines.push(Line::raw(format!(
+            "{:<16} {:>5}% {:>8} {:>8} {:>6} {:>7} {:>6} {:>9} {:>9}",
+            clip(&j.name, 16),
+            u(j, "pcpu"),
+            human(u(j, "memoryuse")),
+            human(u(j, "swapuse")),
+            u(j, "maxproc"),
+            u(j, "nthr"),
+            u(j, "openfiles"),
+            human(u(j, "readbps")),
+            human(u(j, "writebps"))
+        )));
+    }
+    let rules: Vec<_> = jails.iter().flat_map(|j| j.rules.iter().map(move |r| (*j, r))).collect();
+    if rules.is_empty() {
+        lines.push(dim("No rctl limits on these jails"));
+        return lines;
+    }
+    lines.push(hdr(format!("{:<16} {:<14} {:>10} {:>10} {:>7}  {}", "rctl limit", "Resource", "Used", "Limit", "Use%", "Action")));
+    for (j, rule) in rules {
+        let used = rule.used(j);
+        let (now, pct) = match used {
+            Some(f) => (racct_value(&rule.resource, j.usage(&rule.resource).unwrap_or(0)), format!("{:.1}%", f * 100.0)),
+            None => ("-".into(), "-".into()),
+        };
+        let per = if rule.per == "jail" { String::new() } else { format!(" per {}", rule.per) };
+        lines.push(Line::styled(
+            format!(
+                "{:<16} {:<14} {:>10} {:>10} {:>7}  {}{per}",
+                clip(&j.name, 16),
+                rule.resource,
+                now,
+                racct_value(&rule.resource, rule.amount),
+                pct,
+                rule.action
+            ),
+            used.map_or(DIM, fill_style),
+        ));
+    }
     lines
 }
 
@@ -2372,6 +2445,16 @@ fn checks(s: &Sample) -> Vec<Line<'static>> {
             }
         }
     }
+    for j in &snap.jails {
+        for rule in &j.rules {
+            if let Some(used) = rule.used(j) {
+                out.push((
+                    level(used, 0.8, 0.95),
+                    format!("Jail {} {} {:.0}% of its {} limit (warn 80, danger 95)", j.name, rule.resource, used * 100.0, rule.action),
+                ));
+            }
+        }
+    }
     for l in &snap.limits {
         let used = l.used as f64 / l.limit.max(1) as f64;
         out.push((
@@ -2675,6 +2758,34 @@ mod render_tests {
         assert!(checks.iter().any(|l| l.starts_with("DANGER") && l.contains("ZFS device nda0p3 (zroot) FAULTED")));
         assert!(checks.iter().any(|l| l.starts_with("WARNING") && l.contains("ada0p3 (zroot): 0 read, 0 write, 7 checksum")));
         assert!(checks.iter().any(|l| l.starts_with("DANGER") && l.contains("2 permanent data errors")));
+    }
+
+    #[test]
+    fn jail_accounting_and_limits() {
+        let mut s = demo_sample();
+        let text = |lines: Vec<Line>| -> Vec<String> {
+            lines.iter().map(|l| l.spans.iter().map(|s| s.content.as_ref()).collect()).collect()
+        };
+        let lines = text(jail_racct(&s.snap));
+        assert!(lines[0].starts_with("Jail") && lines[0].ends_with("(kernel accounting, RACCT)"));
+        assert!(lines.iter().any(|l| l.starts_with("www") && l.contains("870.0M")));
+        assert!(lines.iter().any(|l| l.starts_with("www") && l.contains("memoryuse") && l.contains("85.0%") && l.ends_with("deny")));
+        assert!(lines.iter().any(|l| l.starts_with("www") && l.contains("openfiles") && l.ends_with("deny per process") && l.contains(" - ")));
+        let checks = text(checks(&s));
+        assert!(checks.iter().any(|l| l.starts_with("WARNING") && l.contains("Jail www memoryuse 85% of its deny limit")));
+
+        // Unprivileged: the section says why it is missing.
+        for j in &mut s.snap.jails {
+            j.racct = None;
+            j.rules.clear();
+        }
+        let c = s.snap.collectors.iter_mut().find(|c| c.name == "rctl").unwrap();
+        c.state = Availability::Denied;
+        c.detail = Some("rctl: Operation not permitted (os error 1)".into());
+        assert_eq!(
+            text(jail_racct(&s.snap)),
+            ["Kernel accounting (RACCT) denied (needs root): rctl: Operation not permitted (os error 1)"]
+        );
     }
 
     #[test]

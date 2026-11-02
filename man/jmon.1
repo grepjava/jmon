@@ -93,7 +93,14 @@ that jmon keeps running while pools are imported, averaged over 5 seconds
 .It Cm J
 jails and
 .Xr bhyve 8
-virtual machines
+virtual machines.
+With RACCT enabled
+.Pq Va kern.racct.enable Ns =1
+and jmon running as root, also each jail's kernel accounting and how much
+of each
+.Xr rctl 8
+limit on it is in use; per-process and per-user limits are listed
+without a percentage
 .It Cm s
 CPU temperature (current, hottest core, and session peak with its time),
 clock, ACPI thermal zones, battery.

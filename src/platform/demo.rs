@@ -323,8 +323,24 @@ impl Collector {
             tcp: Some(self.tcp.clone()),
             udp: Some(self.udp),
             jails: vec![
-                Jail { jid: 1, name: "www".into(), hostname: "www.example.org".into() },
-                Jail { jid: 2, name: "db".into(), hostname: "db.example.org".into() },
+                Jail {
+                    jid: 1,
+                    name: "www".into(),
+                    hostname: "www.example.org".into(),
+                    racct: Some(racct(870 << 20, 12, 3, 140)),
+                    rules: vec![
+                        RctlRule { resource: "memoryuse".into(), action: "deny".into(), amount: 1 << 30, per: "jail".into() },
+                        RctlRule { resource: "maxproc".into(), action: "deny".into(), amount: 64, per: "jail".into() },
+                        RctlRule { resource: "openfiles".into(), action: "deny".into(), amount: 4096, per: "process".into() },
+                    ],
+                },
+                Jail {
+                    jid: 2,
+                    name: "db".into(),
+                    hostname: "db.example.org".into(),
+                    racct: Some(racct(2 << 30, 4, 18, 210)),
+                    rules: vec![],
+                },
             ],
             zfs: Some(Zfs { arc_size: arc, arc_target: arc + GIB / 2, pools: self.pools(now_wall), ..self.zfs.clone() }),
             nfs: Some(self.nfs.clone()),
@@ -444,6 +460,25 @@ impl Collector {
     }
 }
 
+/// RACCT usage like rctl -u gives for a jail.
+fn racct(memory: u64, procs: u64, pcpu: u64, files: u64) -> Vec<(String, u64)> {
+    [
+        ("cputime", 86_400),
+        ("memoryuse", memory),
+        ("vmemoryuse", memory * 3),
+        ("swapuse", 0),
+        ("maxproc", procs),
+        ("nthr", procs * 4),
+        ("openfiles", files),
+        ("pcpu", pcpu),
+        ("readbps", 2 << 20),
+        ("writebps", 512 << 10),
+    ]
+    .iter()
+    .map(|(k, v)| (k.to_string(), *v))
+    .collect()
+}
+
 /// The FreeBSD collectors with typical durations in milliseconds.
 const COLLECTORS: &[(&str, f64)] = &[
     ("cpu", 0.02),
@@ -466,6 +501,7 @@ const COLLECTORS: &[(&str, f64)] = &[
     ("zpool", 0.4),
     ("zpool_status", 0.05),
     ("zpool_iostat", 0.01),
+    ("rctl", 0.04),
     ("limits", 0.01),
     ("uma", 0.4),
 ];
